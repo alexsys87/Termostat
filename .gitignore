@@ -2,3 +2,6 @@
 Debug/
 Release/
 *.dep
+
+# Host unit tests
+tests/build/
