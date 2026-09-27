@@ -1902,11 +1902,11 @@
                 </option>
                 <option>
                     <name>IlinkIcfOverride</name>
-                    <state>0</state>
+                    <state>1</state>
                 </option>
                 <option>
                     <name>IlinkIcfFile</name>
-                    <state>$TOOLKIT_DIR$/config/linker/ST/stm32f030x4.icf</state>
+                    <state>$PROJ_DIR$\Termostat.icf</state>
                 </option>
                 <option>
                     <name>IlinkIcfFileSlave</name>

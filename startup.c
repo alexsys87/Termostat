@@ -22,7 +22,7 @@ typedef union
 
 __root const uVectorEntry __vector_table[] @ ".intvec" =
 {
-    { .ulPtr = (unsigned long)&CSTACK$$Limit },  // Вершина стека
+    { .ulPtr = (unsigned long)&CSTACK$$Limit },  // Top of the stack
     ResetISR,                                                                   // -15
     NmiISR,                                                                     // -14
     FaultISR,                                                                   // -13

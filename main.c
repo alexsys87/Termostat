@@ -9,1341 +9,907 @@ volatile uint8_t virtual_btn_down = 0;
 volatile uint8_t virtual_btn_enter = 0;
 #endif
 
-// ==================== Переменные для меню ====================
-void * current_edit_value = NULL;
-uint8_t current_edit_type = 0;
-char edit_buffer[12]; // Буфер для 8x2 экрана
-
-// ==================== Структуры и глобальные переменные ====================
+// ==================== Global variables ====================
 thermostat_t thermo;
-HD44780 lcd;
-menu_state_t global_menu_state;
+static HD44780 lcd;
+static menu_state_t menu;
 
 volatile uint32_t tick_count = 0;
+static uint32_t ticks_per_us = 0;              // SysTick ticks in 1 us (set in systick_init)
 
-// Управление неблокирующим beep на PF1 (пассивный бузер)
-static volatile uint8_t beep_active = 0;       // 1 - звук воспроизводится
-static volatile uint16_t beep_half_periods = 0; // оставшиеся полупериоды (2 полупериода = 1 мс при 2 кГц)
+// Non-blocking beep on PF1 (passive buzzer)
+static volatile uint8_t beep_active = 0;        // 1 - sound is playing
+static volatile uint16_t beep_half_periods = 0; // remaining half-periods (4 per ms at 2 kHz)
 
-// ==================== Хелперы для STM32F030F4 (Экономия Flash-памяти) ====================
+// ==================== Buttons ====================
+typedef struct {
+    uint16_t pin;
+    uint8_t allow_repeat;   // auto-repeat while held
+    uint8_t raw;            // last sampled level, 1 = pressed
+    uint8_t pressed;        // debounced state
+    uint8_t repeat_count;   // auto-repeat events since press (for acceleration)
+    uint32_t last_change;   // time of the last raw level change
+    uint32_t last_event;    // time of the last press/repeat event
+} button_t;
 
-// Вспомогательная функция для перевода числа в строку (экономит память)
-static void u32tostr(uint32_t val, char *dst, uint8_t is_signed) {
-    char temp[11];
-    uint8_t i = 0;
-    uint8_t negative = 0;
+static button_t btn_up    = {.pin = BTN_UP_PIN, .allow_repeat = 1};
+static button_t btn_down  = {.pin = BTN_DOWN_PIN, .allow_repeat = 1};
+static button_t btn_enter = {.pin = BTN_ENTER_PIN, .allow_repeat = 0};  // no auto-repeat: holding Enter must not jump through menus
 
-    if (is_signed) {
-        int32_t sval = (int32_t)val;
-        if (sval < 0) {
-            negative = 1;
-            val = (uint32_t)(-sval);
-        }
-    }
+// ==================== Parameter descriptors ====================
+// Limits and steps are in scaled units: float value * 10^decimals
 
-    // Извлекаем цифры (они получаются в обратном порядке)
-    do {
-        temp[i++] = (val % 10) + '0';
-        val /= 10;
-    } while (val > 0);
+static const char* const LBL_OFF_ON[] = {"Off", "On"};
+static const char* const LBL_NO_YES[] = {"No", "Yes"};
+static const char* const LBL_REG[]    = {"ON/OFF", "PID"};
+static const char* const LBL_MODE[]   = {"Heat", "Cool"};
+static const char* const LBL_RELAY[]  = {"NO", "NC"};
+static const char* const LBL_UNITS[]  = {"C", "F"};
+static const char* const LBL_MANUAL[] = {"Auto", "Man On", "Man Off"};
 
-    if (negative) {
-        temp[i++] = '-';
-    }
+#define P_FLOAT(var, lo, hi, st, dec, sfx) {&thermo.var, NULL, sfx, lo, hi, st, PARAM_FLOAT, dec, 0}
+#define P_U8(var, lo, hi, st, sfx)         {&thermo.var, NULL, sfx, lo, hi, st, PARAM_U8, 0, 0}
+#define P_U16(var, lo, hi, st, sfx)        {&thermo.var, NULL, sfx, lo, hi, st, PARAM_U16, 0, 0}
+#define P_ENUM(var, labels)                {&thermo.var, labels, NULL, 0, COUNT_OF(labels) - 1, 1, PARAM_U8, 0, 0}
+#define P_TEMP(var, st)                    P_FLOAT(var, -550, 1250, st, 1, NULL)  // DS18B20 range -55..125 C
 
-    // Переворачиваем строку в целевой буфер
-    while (i > 0) {
-        *dst++ = temp[--i];
-    }
-    *dst = '\0';
-}
+// Basic
+static const param_desc_t P_REG       = P_ENUM(regulator_type, LBL_REG);
+static const param_desc_t P_SETPOINT  = P_TEMP(setpoint, 5);
+static const param_desc_t P_HYST      = P_FLOAT(hysteresis, 1, 200, 1, 1, NULL);     // 0.1..20.0
+static const param_desc_t P_CAL       = P_FLOAT(calibration, -100, 100, 1, 1, NULL); // -10.0..+10.0
+static const param_desc_t P_MODE      = P_ENUM(mode, LBL_MODE);
+static const param_desc_t P_RELAY     = P_ENUM(relay_logic, LBL_RELAY);
+static const param_desc_t P_UNITS     = P_ENUM(temp_units, LBL_UNITS);
+static const param_desc_t P_SAFETY    = P_ENUM(safety_enabled, LBL_OFF_ON);
+static const param_desc_t P_TEMP_MIN  = P_TEMP(temp_min, 5);
+static const param_desc_t P_TEMP_MAX  = P_TEMP(temp_max, 5);
+static const param_desc_t P_MANUAL    = P_ENUM(manual_mode, LBL_MANUAL);
+// PID
+static const param_desc_t P_KP        = P_FLOAT(kp, 0, 9999, 1, 1, NULL);            // 0..999.9
+static const param_desc_t P_KI        = P_FLOAT(ki, 0, 9999, 1, 2, NULL);            // 0..99.99
+static const param_desc_t P_KD        = P_FLOAT(kd, 0, 9999, 1, 1, NULL);            // 0..999.9
+static const param_desc_t P_PID_INT   = P_U16(pid_interval, 100, 30000, 100, "ms");
+static const param_desc_t P_PWM_PER   = P_U16(pwm_period, 1, 600, 1, "s");
+static const param_desc_t P_PID_LIM   = P_FLOAT(pid_output_limit, 0, 100, 1, 0, "%");
+// Advanced
+static const param_desc_t P_FILTER    = P_U8(temp_filter, 0, 10, 1, NULL);
+static const param_desc_t P_RES       = P_U8(temp_resolution, 9, 12, 1, "bit");
+static const param_desc_t P_RDELAY    = P_U8(relay_delay, 0, 255, 1, "s");
+static const param_desc_t P_CYCLE     = P_U8(cycle_protection, 0, 60, 1, "min");
+static const param_desc_t P_SCHEDULE  = P_ENUM(schedule_enabled, LBL_OFF_ON);
+static const param_desc_t P_CLOCK     = {&thermo.current_hour, NULL, "h", 0, 23, 1, PARAM_U8, 0, PF_NOSAVE};
+static const param_desc_t P_DAY_SP    = P_TEMP(day_setpoint, 5);
+static const param_desc_t P_NIGHT_SP  = P_TEMP(night_setpoint, 5);
+static const param_desc_t P_DAY_H     = P_U8(day_start_hour, 0, 23, 1, "h");
+static const param_desc_t P_NIGHT_H   = P_U8(night_start_hour, 0, 23, 1, "h");
+// Two-point calibration
+static const param_desc_t P_CAL1_T    = P_TEMP(cal_point1_temp, 1);
+static const param_desc_t P_CAL1_M    = P_TEMP(cal_point1_measured, 1);
+static const param_desc_t P_CAL2_T    = P_TEMP(cal_point2_temp, 1);
+static const param_desc_t P_CAL2_M    = P_TEMP(cal_point2_measured, 1);
+// System
+static const param_desc_t P_AUTOSAVE  = P_ENUM(auto_save, LBL_OFF_ON);
+static const param_desc_t P_BEEP      = P_ENUM(beep_enabled, LBL_OFF_ON);
+static const param_desc_t P_PWR       = P_ENUM(power_save, LBL_OFF_ON);
+static const param_desc_t P_UPDATE    = P_U8(update_interval, 1, 60, 1, "s");
+static const param_desc_t P_KEYREP    = P_ENUM(key_repeat, LBL_OFF_ON);
+static const param_desc_t P_REP_DELAY = P_U16(key_repeat_delay, 100, 3000, 50, "ms");
+static const param_desc_t P_REP_RATE  = P_U16(key_repeat_rate, 20, 1000, 10, "ms");
+static const param_desc_t P_DEBOUNCE  = P_U16(debounce_time, 5, 200, 5, "ms");
+static const param_desc_t P_TIMEOUT   = P_U8(display_timeout, 0, 255, 1, "min");
+static const param_desc_t P_FACTORY   = {&thermo.confirm, LBL_NO_YES, NULL, 0, 1, 1, PARAM_U8, 0, PF_NOSAVE};
+// Statistics
+static const param_desc_t P_RUNTIME   = {&thermo.total_runtime, NULL, "m", 0, 0, 0, PARAM_U32, 0, PF_READONLY};
+static const param_desc_t P_CYCLES    = {&thermo.relay_cycles, NULL, NULL, 0, 0, 0, PARAM_U32, 0, PF_READONLY};
+static const param_desc_t P_CLEAR     = {&thermo.confirm, LBL_NO_YES, NULL, 0, 1, 1, PARAM_U8, 0, PF_NOSAVE};
 
-// Легковесная замена стандартному snprintf
-int mini_snprintf(char *buffer, size_t buf_size, const char *format, ...) {
-    if (buffer == NULL || buf_size == 0) return 0;
-    
-    va_list args;
-    va_start(args, format);
-    
-    size_t count = 0;
-    const char *p = format;
-    
-    while (*p != '\0' && count < buf_size - 1) {
-        if (*p != '%') {
-            buffer[count++] = *p++;
-            continue;
-        }
-        
-        p++; // Пропускаем символ '%'
-        
-        uint8_t left_align = 0;
-        if (*p == '-') {
-            left_align = 1;
-            p++;
-        }
-        
-        uint8_t width = 0;
-        while (*p >= '0' && *p <= '9') {
-            width = width * 10 + (*p - '0');
-            p++;
-        }
-        
-        char tmp_buf[12];
-        const char *str_val = tmp_buf;
-        char c_val[2] = {0, 0};
-        
-        switch (*p) {
-            case 'd': {
-                int32_t val = va_arg(args, int32_t);
-                u32tostr((uint32_t)val, tmp_buf, 1);
-                break;
-            }
-            case 'u': {
-                uint32_t val = va_arg(args, uint32_t);
-                u32tostr(val, tmp_buf, 0);
-                break;
-            }
-            case 's': {
-                str_val = va_arg(args, const char *);
-                if (!str_val) str_val = "(null)";
-                break;
-            }
-            case 'c': {
-                c_val[0] = (char)va_arg(args, int);
-                str_val = c_val;
-                break;
-            }
-            case '%': {
-                c_val[0] = '%';
-                str_val = c_val;
-                break;
-            }
-            default: {
-                // Игнорируем неизвестные спецификаторы
-                p++;
-                continue;
-            }
-        }
-        
-        // Считаем длину подставляемого значения
-        size_t len = 0;
-        while (str_val[len] != '\0') len++;
-        
-        // Заполнение пробелами слева (выравнивание вправо, например %5s)
-        if (!left_align && width > len) {
-            for (uint8_t i = 0; i < width - len && count < buf_size - 1; i++) {
-                buffer[count++] = ' ';
-            }
-        }
-        
-        // Копирование самого значения
-        for (size_t i = 0; i < len && count < buf_size - 1; i++) {
-            buffer[count++] = str_val[i];
-        }
-        
-        // Заполнение пробелами справа (выравнивание влево, например %-3s)
-        if (left_align && width > len) {
-            for (uint8_t i = 0; i < width - len && count < buf_size - 1; i++) {
-                buffer[count++] = ' ';
-            }
-        }
-        
-        p++; // Пропускаем символ спецификатора (d, s, c и т.д.)
-    }
-    
-    buffer[count] = '\0';
-    va_end(args);
-    
-    return count;
-}
+// All stored parameters: validated after loading from Flash
+static const param_desc_t* const stored_params[] = {
+    &P_REG, &P_SETPOINT, &P_HYST, &P_CAL, &P_MODE, &P_RELAY, &P_UNITS, &P_SAFETY, &P_TEMP_MIN,
+    &P_TEMP_MAX, &P_MANUAL, &P_KP, &P_KI, &P_KD, &P_PID_INT, &P_PWM_PER, &P_PID_LIM, &P_FILTER,
+    &P_RES, &P_RDELAY, &P_CYCLE, &P_SCHEDULE, &P_DAY_SP, &P_NIGHT_SP, &P_DAY_H, &P_NIGHT_H,
+    &P_CAL1_T, &P_CAL1_M, &P_CAL2_T, &P_CAL2_M, &P_AUTOSAVE, &P_BEEP, &P_PWR, &P_UPDATE,
+    &P_KEYREP, &P_REP_DELAY, &P_REP_RATE, &P_DEBOUNCE, &P_TIMEOUT
+};
 
-// Перевод float в строку без использования %f (экономит ~8 КБ Flash)
-void format_float_to_str(char * buf, size_t size, float val) {
-  if (val < 0.0f) {
-    int i_val = (int)(-val);
-    int f_val = (int)((-val - i_val) * 10.0f + 0.5f);
-    if (f_val > 9) {
-      i_val++;
-      f_val = 0;
-    }
-    if (i_val == 0) mini_snprintf(buf, size, "-0.%1d", f_val);
-    else mini_snprintf(buf, size, "-%d.%1d", i_val, f_val);
-  } else {
-    int i_val = (int) val;
-    int f_val = (int)((val - i_val) * 10.0f + 0.5f);
-    if (f_val > 9) {
-      i_val++;
-      f_val = 0;
-    }
-    mini_snprintf(buf, size, "%d.%1d", i_val, f_val);
-  }
-}
+// ==================== Menu structure (texts up to 7 characters) ====================
 
-// Универсальная настройка пинов выхода
-void setup_gpio_output(GPIO_TypeDef * port, uint16_t pin_mask) {
-  for (int i = 0; i < 16; i++) {
-    if (pin_mask & (1 << i)) {
-      port->MODER &= ~(0x3 << (i * 2));
-      port->MODER |= (0x1 << (i * 2));
-      port->OTYPER &= ~(1 << i);
-      port->OSPEEDR |= (0x3 << (i * 2)); // High speed
-    }
-  }
-}
-
-// Универсальная настройка пинов входа с подтяжкой (Pull-Up)
-void setup_gpio_input_pullup(GPIO_TypeDef * port, uint16_t pin_mask) {
-  for (int i = 0; i < 16; i++) {
-    if (pin_mask & (1 << i)) {
-      port->MODER &= ~(0x3 << (i * 2));
-      port->PUPDR &= ~(0x3 << (i * 2));
-      port->PUPDR |= (0x1 << (i * 2));
-    }
-  }
-}
-
-// ==================== Реализация функций меню ====================
-
-// Функции для редактирования float-параметров
-void menu_setpoint_action(void) {
-  current_edit_value = & thermo.setpoint;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_hysteresis_action(void) {
-  current_edit_value = & thermo.hysteresis;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_calibration_action(void) {
-  current_edit_value = & thermo.calibration;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_temp_min_action(void) {
-  current_edit_value = & thermo.temp_min;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_temp_max_action(void) {
-  current_edit_value = & thermo.temp_max;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_pid_kp_action(void) {
-  current_edit_value = & thermo.kp;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_pid_ki_action(void) {
-  current_edit_value = & thermo.ki;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_pid_kd_action(void) {
-  current_edit_value = & thermo.kd;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_pid_output_limit_action(void) {
-  current_edit_value = & thermo.pid_output_limit;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_day_setpoint_action(void) {
-  current_edit_value = & thermo.day_setpoint;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_night_setpoint_action(void) {
-  current_edit_value = & thermo.night_setpoint;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_cal_point1_temp_action(void) {
-  current_edit_value = & thermo.cal_point1_temp;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_cal_point1_measured_action(void) {
-  current_edit_value = & thermo.cal_point1_measured;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_cal_point2_temp_action(void) {
-  current_edit_value = & thermo.cal_point2_temp;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_cal_point2_measured_action(void) {
-  current_edit_value = & thermo.cal_point2_measured;
-  current_edit_type = 0;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-
-// Функции для редактирования uint8 параметров
-void menu_regulator_type_action(void) {
-  current_edit_value = & thermo.regulator_type;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_mode_action(void) {
-  current_edit_value = & thermo.mode;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_relay_logic_action(void) {
-  current_edit_value = & thermo.relay_logic;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_auto_save_action(void) {
-  current_edit_value = & thermo.auto_save;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_beep_action(void) {
-  current_edit_value = & thermo.beep_enabled;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_display_timeout_action(void) {
-  current_edit_value = & thermo.display_timeout;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_temp_units_action(void) {
-  current_edit_value = & thermo.temp_units;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_safety_enabled_action(void) {
-  current_edit_value = & thermo.safety_enabled;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_temp_filter_action(void) {
-  current_edit_value = & thermo.temp_filter;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_temp_resolution_action(void) {
-  current_edit_value = & thermo.temp_resolution;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_relay_delay_action(void) {
-  current_edit_value = & thermo.relay_delay;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_cycle_protection_action(void) {
-  current_edit_value = & thermo.cycle_protection;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_schedule_enabled_action(void) {
-  current_edit_value = & thermo.schedule_enabled;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_day_start_action(void) {
-  current_edit_value = & thermo.day_start_hour;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_night_start_action(void) {
-  current_edit_value = & thermo.night_start_hour;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_display_contrast_action(void) {
-  current_edit_value = & thermo.display_contrast;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_display_rotation_action(void) {
-  current_edit_value = & thermo.display_rotation;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_display_metrics_action(void) {
-  current_edit_value = & thermo.display_metrics;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_power_save_action(void) {
-  current_edit_value = & thermo.power_save;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_update_interval_action(void) {
-  current_edit_value = & thermo.update_interval;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_manual_mode_action(void) {
-  current_edit_value = & thermo.manual_mode;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_key_repeat_action(void) {
-  current_edit_value = & thermo.key_repeat;
-  current_edit_type = 1;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-
-// Функции для редактирования uint16 параметров
-void menu_pid_interval_action(void) {
-  current_edit_value = & thermo.pid_interval;
-  current_edit_type = 2;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_pwm_period_action(void) {
-  current_edit_value = & thermo.pwm_period;
-  current_edit_type = 2;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_key_repeat_delay_action(void) {
-  current_edit_value = & thermo.key_repeat_delay;
-  current_edit_type = 2;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_key_repeat_rate_action(void) {
-  current_edit_value = & thermo.key_repeat_rate;
-  current_edit_type = 2;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_debounce_time_action(void) {
-  current_edit_value = & thermo.debounce_time;
-  current_edit_type = 2;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-
-// Функции для отображения статистики (uint32)
-void menu_show_runtime_action(void) {
-  current_edit_value = & thermo.total_runtime;
-  current_edit_type = 3;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-void menu_show_cycles_action(void) {
-  current_edit_value = & thermo.relay_cycles;
-  current_edit_type = 3;
-  global_menu_state.edit_mode = 1;
-  update_menu_display();
-}
-
-// Функции действий (без редактирования)
-void menu_factory_reset_action(void) {
-  set_default_parameters();
-  save_parameters();
-  thermo.update_display = 1;
-  global_menu_state.current_menu = NULL;
-  beep(1000);
-}
-void menu_clear_stats_action(void) {
-  thermo.total_runtime = 0;
-  thermo.relay_cycles = 0;
-  thermo.params_changed = 1;
-  save_if_changed();
-  beep(200);
-}
-void menu_back_action(void) {
-  global_menu_state.current_menu = NULL;
-  thermo.update_display = 1;
-  save_if_changed();
-}
-
-// ==================== Определение структуры меню ====================
+static void menu_save_action(void);
 
 MENU_ITEMS(basic_menu) = {
-  MENU_LEAF(101, 1, "Reg", menu_regulator_type_action),
-  MENU_LEAF(102, 1, "Setp", menu_setpoint_action),
-  MENU_LEAF(103, 1, "Hyst", menu_hysteresis_action),
-  MENU_LEAF(104, 1, "Cal", menu_calibration_action),
-  MENU_LEAF(105, 1, "Mode", menu_mode_action),
-  MENU_LEAF(106, 1, "Relay", menu_relay_logic_action),
-  MENU_LEAF(107, 1, "Units", menu_temp_units_action),
-  MENU_LEAF(108, 1, "Safe", menu_safety_enabled_action),
-  MENU_LEAF(109, 1, "Min", menu_temp_min_action),
-  MENU_LEAF(110, 1, "Max", menu_temp_max_action),
-  MENU_LEAF(111, 1, "Manual", menu_manual_mode_action),
-  MENU_LEAF(112, 1, "Back", menu_back_action)
+    MENU_PARAM("Reg", P_REG),
+    MENU_PARAM("Setp", P_SETPOINT),
+    MENU_PARAM("Hyst", P_HYST),
+    MENU_PARAM("Cal", P_CAL),
+    MENU_PARAM("Mode", P_MODE),
+    MENU_PARAM("Relay", P_RELAY),
+    MENU_PARAM("Units", P_UNITS),
+    MENU_PARAM("Safe", P_SAFETY),
+    MENU_PARAM("Min", P_TEMP_MIN),
+    MENU_PARAM("Max", P_TEMP_MAX),
+    MENU_PARAM("Manual", P_MANUAL),
+    MENU_BACK("Back")
 };
 
 MENU_ITEMS(pid_menu) = {
-  MENU_LEAF(201, 2, "Kp", menu_pid_kp_action),
-  MENU_LEAF(202, 2, "Ki", menu_pid_ki_action),
-  MENU_LEAF(203, 2, "Kd", menu_pid_kd_action),
-  MENU_LEAF(204, 2, "P.Int", menu_pid_interval_action),
-  MENU_LEAF(205, 2, "P.Per", menu_pwm_period_action),
-  MENU_LEAF(206, 2, "Lim", menu_pid_output_limit_action),
-  MENU_LEAF(207, 2, "Back", menu_back_action)
+    MENU_PARAM("Kp", P_KP),
+    MENU_PARAM("Ki", P_KI),
+    MENU_PARAM("Kd", P_KD),
+    MENU_PARAM("P.Int", P_PID_INT),
+    MENU_PARAM("P.Per", P_PWM_PER),
+    MENU_PARAM("Lim", P_PID_LIM),
+    MENU_BACK("Back")
 };
 
 MENU_ITEMS(advanced_menu) = {
-  MENU_LEAF(301, 3, "Filt", menu_temp_filter_action),
-  MENU_LEAF(302, 3, "Res", menu_temp_resolution_action),
-  MENU_LEAF(303, 3, "Dly", menu_relay_delay_action),
-  MENU_LEAF(304, 3, "Cyc", menu_cycle_protection_action),
-  MENU_LEAF(305, 3, "Sch", menu_schedule_enabled_action),
-  MENU_LEAF(306, 3, "Day", menu_day_setpoint_action),
-  MENU_LEAF(307, 3, "Night", menu_night_setpoint_action),
-  MENU_LEAF(308, 3, "DSta", menu_day_start_action),
-  MENU_LEAF(309, 3, "NSta", menu_night_start_action),
-  MENU_LEAF(310, 3, "Back", menu_back_action)
+    MENU_PARAM("Filt", P_FILTER),
+    MENU_PARAM("Res", P_RES),
+    MENU_PARAM("Dly", P_RDELAY),
+    MENU_PARAM("Cyc", P_CYCLE),
+    MENU_PARAM("Sch", P_SCHEDULE),
+    MENU_PARAM("Time", P_CLOCK),
+    MENU_PARAM("Day", P_DAY_SP),
+    MENU_PARAM("Night", P_NIGHT_SP),
+    MENU_PARAM("DSta", P_DAY_H),
+    MENU_PARAM("NSta", P_NIGHT_H),
+    MENU_BACK("Back")
 };
 
 MENU_ITEMS(calibration_menu) = {
-  MENU_LEAF(401, 4, "P1T", menu_cal_point1_temp_action),
-  MENU_LEAF(402, 4, "P1M", menu_cal_point1_measured_action),
-  MENU_LEAF(403, 4, "P2T", menu_cal_point2_temp_action),
-  MENU_LEAF(404, 4, "P2M", menu_cal_point2_measured_action),
-  MENU_LEAF(405, 4, "Back", menu_back_action)
-};
-
-MENU_ITEMS(display_menu) = {
-  MENU_LEAF(501, 5, "Cont", menu_display_contrast_action),
-  MENU_LEAF(502, 5, "Rot", menu_display_rotation_action),
-  MENU_LEAF(503, 5, "Metr", menu_display_metrics_action),
-  MENU_LEAF(504, 5, "TOut", menu_display_timeout_action),
-  MENU_LEAF(505, 5, "Back", menu_back_action)
+    MENU_PARAM("P1T", P_CAL1_T),
+    MENU_PARAM("P1M", P_CAL1_M),
+    MENU_PARAM("P2T", P_CAL2_T),
+    MENU_PARAM("P2M", P_CAL2_M),
+    MENU_BACK("Back")
 };
 
 MENU_ITEMS(system_menu) = {
-  MENU_LEAF(601, 6, "Auto", menu_auto_save_action),
-  MENU_LEAF(602, 6, "Beep", menu_beep_action),
-  MENU_LEAF(603, 6, "Pwr", menu_power_save_action),
-  MENU_LEAF(604, 6, "Upd", menu_update_interval_action),
-  MENU_LEAF(605, 6, "KeyR", menu_key_repeat_action),
-  MENU_LEAF(606, 6, "RptD", menu_key_repeat_delay_action),
-  MENU_LEAF(607, 6, "RptR", menu_key_repeat_rate_action),
-  MENU_LEAF(608, 6, "Deb", menu_debounce_time_action),
-  MENU_LEAF(609, 6, "Fact", menu_factory_reset_action),
-  MENU_LEAF(610, 6, "Back", menu_back_action)
+    MENU_PARAM("Auto", P_AUTOSAVE),
+    MENU_ACTION("Save", menu_save_action),
+    MENU_PARAM("Beep", P_BEEP),
+    MENU_PARAM("Pwr", P_PWR),
+    MENU_PARAM("Upd", P_UPDATE),
+    MENU_PARAM("TOut", P_TIMEOUT),
+    MENU_PARAM("KeyR", P_KEYREP),
+    MENU_PARAM("RptD", P_REP_DELAY),
+    MENU_PARAM("RptR", P_REP_RATE),
+    MENU_PARAM("Deb", P_DEBOUNCE),
+    MENU_PARAM("Fact", P_FACTORY),
+    MENU_BACK("Back")
 };
 
 MENU_ITEMS(stats_menu) = {
-  MENU_LEAF(701, 7, "Run", menu_show_runtime_action),
-  MENU_LEAF(702, 7, "Cycl", menu_show_cycles_action),
-  MENU_LEAF(703, 7, "Clr", menu_clear_stats_action),
-  MENU_LEAF(704, 7, "Back", menu_back_action)
+    MENU_PARAM("Run", P_RUNTIME),
+    MENU_PARAM("Cycl", P_CYCLES),
+    MENU_PARAM("Clr", P_CLEAR),
+    MENU_BACK("Back")
 };
 
 MENU_ITEMS(main_menu) = {
-  MENU_NODE(1, 0, "Basic", basic_menu),
-  MENU_NODE(2, 0, "PID", pid_menu),
-  MENU_NODE(3, 0, "Adv", advanced_menu),
-  MENU_NODE(4, 0, "Cal", calibration_menu),
-  MENU_NODE(5, 0, "Disp", display_menu),
-  MENU_NODE(6, 0, "Sys", system_menu),
-  MENU_NODE(7, 0, "Stats", stats_menu),
-  MENU_LEAF(8, 0, "Back", menu_back_action)
+    MENU_NODE("Basic", basic_menu),
+    MENU_NODE("PID", pid_menu),
+    MENU_NODE("Adv", advanced_menu),
+    MENU_NODE("Cal", calibration_menu),
+    MENU_NODE("Sys", system_menu),
+    MENU_NODE("Stats", stats_menu),
+    MENU_BACK("Back")
 };
 
-// ==================== Аппаратные функции и задержки ====================
+// ==================== Hardware helpers ====================
 
-// Точная микросекундная задержка на базе SysTick (Важно для 1-Wire на Cortex-M0)
+// Generic push-pull output setup
+static void setup_gpio_output(GPIO_TypeDef* port, uint16_t pin_mask) {
+    for (int i = 0; i < 16; i++) {
+        if (pin_mask & (1 << i)) {
+            port->MODER &= ~(0x3 << (i * 2));
+            port->MODER |= (0x1 << (i * 2));
+            port->OTYPER &= ~(1 << i);
+            port->OSPEEDR |= (0x3 << (i * 2)); // High speed
+        }
+    }
+}
+
+// Generic input with pull-up setup
+static void setup_gpio_input_pullup(GPIO_TypeDef* port, uint16_t pin_mask) {
+    for (int i = 0; i < 16; i++) {
+        if (pin_mask & (1 << i)) {
+            port->MODER &= ~(0x3 << (i * 2));
+            port->PUPDR &= ~(0x3 << (i * 2));
+            port->PUPDR |= (0x1 << (i * 2));
+        }
+    }
+}
+
+// Precise microsecond delay based on SysTick (required for 1-Wire on Cortex-M0).
+// Works with interrupts disabled.
 void delay_us(uint32_t us) {
-  uint32_t ticks = us * (SystemCoreClock / 1000000);
-  uint32_t start = SysTick->VAL;
-  uint32_t load = SysTick->LOAD;
-  uint32_t elapsed = 0;
+    uint32_t ticks = us * ticks_per_us;
+    uint32_t reload = SysTick->LOAD + 1;
+    uint32_t start = SysTick->VAL;
+    uint32_t elapsed = 0;
 
-  while (elapsed < ticks) {
-    uint32_t current = SysTick->VAL;
-    if (start >= current) elapsed += (start - current);
-    else elapsed += (start + load - current);
-    start = current;
-  }
+    while (elapsed < ticks) {
+        uint32_t current = SysTick->VAL;
+        // SysTick counts down and reloads from LOAD after reaching 0
+        elapsed += (start >= current) ? (start - current) : (start + reload - current);
+        start = current;
+    }
 }
 
 void delay_ms(uint32_t ms) {
-  while (ms--) delay_us(1000);
+    while (ms--) delay_us(1000);
 }
 
-/**
- * @brief  Подача звукового сигнала на пассивный бузер
- * @param  duration_ms: длительность сигнала в миллисекундах
- * @note   Частота 2 кГц (период 500 мкс). Функция блокирующая.
- */
-/*
-void beep(uint16_t duration_ms) {
-    if (!thermo.beep_enabled) return;
+static void system_clock_init(void) {
+    // 1. Make sure HSI is running
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY));
 
-    uint32_t cycles = duration_ms * 2;   // 2 периода за 1 мс
-    for (uint32_t i = 0; i < cycles; i++) {
-        BEEPER_PORT->BSRR = BEEPER_PIN;  // HIGH
-        delay_us(250);
-        BEEPER_PORT->BRR  = BEEPER_PIN;  // LOW
-        delay_us(250);
+    // 2. Flash latency MUST be set before switching to 48 MHz (1 wait state + prefetch)
+    FLASH->ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY;
+
+    // 3. If PLL is already used, switch to HSI and stop the PLL to reconfigure it
+    if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL) {
+        RCC->CFGR &= ~RCC_CFGR_SW;
+        while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_HSI);
     }
-    BEEPER_PORT->BRR = BEEPER_PIN;       // гарантированно выключить
+    RCC->CR &= ~RCC_CR_PLLON;
+    while (RCC->CR & RCC_CR_PLLRDY);
+
+    // 4. PLL: HSI/2 * 12 = 48 MHz
+    RCC->CFGR2 &= ~RCC_CFGR2_PREDIV1;
+    RCC->CFGR = (RCC->CFGR & ~(RCC_CFGR_PLLMULL | RCC_CFGR_PLLSRC)) | RCC_CFGR_PLLSRC_HSI_DIV2 | RCC_CFGR_PLLMULL12;
+
+    // 5. Start the PLL
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY));
+
+    // 6. Use PLL as the system clock
+    RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
+
+    SystemCoreClockUpdate();
 }
-*/
+
+static void systick_init(void) {
+    ticks_per_us = SystemCoreClock / 1000000;
+    SysTick_Config(SystemCoreClock / 1000); // 1 ms interrupt
+}
+
+static void relay_output(uint8_t on);
+
+static void gpio_init(void) {
+    RCC->AHBENR |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_GPIOBEN | RCC_AHBENR_GPIOFEN;
+
+    // Set the "relay off" level BEFORE the pin becomes an output:
+    // with NC logic "off" is the high level, a low glitch would switch the load on
+    relay_output(0);
+    BEEPER_PORT->BRR = BEEPER_PIN;
+    setup_gpio_output(RELAY_PORT, RELAY_PIN);
+    setup_gpio_output(BEEPER_PORT, BEEPER_PIN);
+
+    setup_gpio_input_pullup(BTN_PORT, BTN_UP_PIN | BTN_DOWN_PIN | BTN_ENTER_PIN);
+}
+
+static void watchdog_init(void) {
+#if USE_WATCHDOG
+    // Freeze the watchdog while the core is halted by the debugger
+    RCC->APB2ENR |= RCC_APB2ENR_DBGMCUEN;
+    DBGMCU->APB1FZ |= DBGMCU_APB1_FZ_DBG_IWDG_STOP;
+
+    // LSI ~40 kHz / 32 = 1250 Hz, 2500 counts = ~2 s
+    IWDG->KR = 0xCCCC;          // start
+    IWDG->KR = 0x5555;          // unlock PR/RLR
+    IWDG->PR = 3;               // prescaler /32
+    IWDG->RLR = 2500;
+    while (IWDG->SR);           // wait until the registers are updated
+    IWDG->KR = 0xAAAA;          // reload
+#endif
+}
+
+static inline void watchdog_feed(void) {
+#if USE_WATCHDOG
+    IWDG->KR = 0xAAAA;
+#endif
+}
+
+// ==================== Beeper ====================
 
 /**
- * @brief Запуск воспроизведения звука на пассивном бузере (неблокирующий)
- * @param duration_ms Длительность звука в миллисекундах
+ * @brief TIM14 generates 4 kHz update interrupts, each toggles PF1 -> 2 kHz tone
+ * @note  48 MHz / (PSC+1) / (ARR+1) = 48e6 / 48 / 250 = 4000 Hz
  */
-void beep(uint16_t duration_ms) {
-    if (!thermo.beep_enabled) return;
-    if (beep_active) return;   // Уже звучит — игнорируем
-
-    // Количество полупериодов: при 2 кГц один полупериод = 250 мкс,
-    // за 1 мс проходит 4 полупериода. Упростим: duration_ms * 4.
-    beep_half_periods = duration_ms * 4;
-    beep_active = 1;
-
-    // Сбрасываем счётчик таймера и включаем прерывание
-    TIM14->CNT = 0;
-    TIM14->CR1 |= TIM_CR1_CEN;   // Убеждаемся, что таймер запущен
-}
-
-void system_clock_init(void)
-{
-  // 1. Включаем HSI (если вдруг выключен) и ждем готовности
-  RCC->CR |= RCC_CR_HSION;
-  while (!(RCC->CR & RCC_CR_HSIRDY));
-
-  // 2. Настройка Flash: ОБЯЗАТЕЛЬНО ДО переключения на 48 МГц
-  // Для 48 МГц на STM32F0 нужен 1 Cycle Latency (LATENCY = 0x01)
-  FLASH->ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY;
-
-  // 3. Если PLL уже включен — переключаемся на HSI и выключаем PLL для настройки
-  if ((RCC->CFGR & RCC_CFGR_SWS) == RCC_CFGR_SWS_PLL) {
-    RCC->CFGR &= ~RCC_CFGR_SW;
-    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_HSI);
-  }
-  RCC->CR &= ~RCC_CR_PLLON;
-  while (RCC->CR & RCC_CR_PLLRDY);
-
-  // 4. Настройка PLL: HSI/2 * 12 = 48 МГц
-  // Убеждаемся, что PREDIV = /1 (для F030 это важно)
-  RCC->CFGR2 &= ~RCC_CFGR2_PREDIV1; 
-  
-  // Выбираем источник PLL (HSI/2) и множитель x12
-  RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_PLLMULL) | RCC_CFGR_PLLMULL12;
-
-  // 5. Включаем PLL и ждем
-  RCC->CR |= RCC_CR_PLLON;
-  while (!(RCC->CR & RCC_CR_PLLRDY));
-
-  // 6. Переключаем систему на PLL
-  RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_PLL;
-  while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL);
-  
-  SystemCoreClockUpdate();
-}
-
-void gpio_init(void) {
-  // Включаем тактирование портов
-  RCC->AHBENR |= RCC_AHBENR_GPIOAEN | RCC_AHBENR_GPIOBEN | RCC_AHBENR_GPIOFEN;
-
-  // Настраиваем выходы через универсальную функцию
-  setup_gpio_output(RELAY_PORT, RELAY_PIN);
-  setup_gpio_output(BEEPER_PORT, BEEPER_PIN);
-
-  // Реле и бузер выкл по умолчанию
-  RELAY_PORT->BRR = RELAY_PIN;
-  BEEPER_PORT->BRR = BEEPER_PIN;
-
-  // Настраиваем кнопки как входы с подтяжкой
-  setup_gpio_input_pullup(BTN_PORT, BTN_UP_PIN | BTN_DOWN_PIN | BTN_ENTER_PIN);
-}
-
-void systick_init(void) {
-  SysTick_Config(SystemCoreClock / 1000); // Прерывание каждую 1 мс
-}
-
-/**
- * @brief Инициализация TIM14 для генерации прерываний 2 кГц (управление пассивным бузером на PF1)
- * @note  Частота = 48 МГц / (PSC+1) / (ARR+1) = 48e6 / 48 / 500 = 2000 Гц
- */
-void beep_timer_init(void) {
-    // Включаем тактирование TIM14 и GPIOF
+static void beep_timer_init(void) {
     RCC->APB1ENR |= RCC_APB1ENR_TIM14EN;
-    RCC->AHBENR |= RCC_AHBENR_GPIOFEN;
 
-    // PF1 настраиваем как push-pull выход (уже должно быть из gpio_init, но на всякий случай)
-    GPIOF->MODER &= ~GPIO_MODER_MODER1;
-    GPIOF->MODER |= GPIO_MODER_MODER1_0;   // Output
-    GPIOF->OTYPER &= ~GPIO_OTYPER_OT_1;    // Push-pull
-    GPIOF->OSPEEDR |= GPIO_OSPEEDER_OSPEEDR1; // High speed
-
-    // Настройка TIM14: PSC = 47 (делитель 48), ARR = 499 (период 500 мкс)
-    TIM14->PSC = 47;      // 48 МГц / 48 = 1 МГц (счётчик тикает каждую 1 мкс)
-    TIM14->ARR = 499;     // 500 тиков = 500 мкс → частота 2 кГц
-    TIM14->CR1 = TIM_CR1_CEN;  // Запускаем таймер (счёт идёт, но прерывание пока отключено)
-
-    // Разрешаем прерывание по обновлению (UEV)
+    TIM14->PSC = 47;      // 1 MHz counter clock
+    TIM14->ARR = 249;     // 250 us = one half-period of the 2 kHz tone
     TIM14->DIER |= TIM_DIER_UIE;
     NVIC_EnableIRQ(TIM14_IRQn);
+    // The timer is started only by beep()
+}
+
+/**
+ * @brief Starts a non-blocking beep on the passive buzzer
+ * @param duration_ms Duration in milliseconds
+ */
+static void beep(uint16_t duration_ms) {
+    if (!thermo.beep_enabled) return;
+    if (beep_active) return;   // already playing
+
+    beep_half_periods = (duration_ms > 16000) ? 64000 : duration_ms * 4; // 4 half-periods per ms
+    beep_active = 1;
+
+    TIM14->CNT = 0;
+    TIM14->CR1 |= TIM_CR1_CEN;
 }
 
 void TIM14_IRQHandler(void) {
     if (TIM14->SR & TIM_SR_UIF) {
-        TIM14->SR &= ~TIM_SR_UIF;   // Сбрасываем флаг
+        TIM14->SR = (uint16_t)~TIM_SR_UIF;   // rc_w0: write 0 only to UIF
 
-        if (beep_active) {
-            // Переключаем PF1
+        if (beep_active && beep_half_periods) {
             GPIOF->ODR ^= GPIO_ODR_1;
-
-            // Уменьшаем счётчик полупериодов
             if (--beep_half_periods == 0) {
-                // Время вышло — выключаем звук
                 beep_active = 0;
-                GPIOF->BRR = GPIO_BRR_BR_1;   // PF1 = 0 (гарантированно LOW)
-                TIM14->CR1 &= ~TIM_CR1_CEN;   // Останавливаем таймер (экономия энергии)
+                BEEPER_PORT->BRR = BEEPER_PIN;   // leave the buzzer pin low
+                TIM14->CR1 &= ~TIM_CR1_CEN;      // stop the timer
             }
         } else {
-            // Если beep не активен, таймер не должен генерировать прерывания,
-            // но на всякий случай выключаем его
+            beep_active = 0;
             TIM14->CR1 &= ~TIM_CR1_CEN;
         }
     }
 }
 
-// ==================== Логика Термостата ====================
+// ==================== Relay ====================
 
-float apply_temp_filter(float new_temp) {
-  if (thermo.temp_filter == 0) return new_temp;
-  float alpha = thermo.temp_filter / 10.0f;
-  thermo.filtered_temp = alpha * new_temp + (1.0f - alpha) * thermo.filtered_temp;
-  return thermo.filtered_temp;
+// Writes the physical pin level according to the relay logic (NO/NC)
+static void relay_output(uint8_t on) {
+    if ((on != 0) != (thermo.relay_logic != 0)) RELAY_PORT->BSRR = RELAY_PIN;
+    else RELAY_PORT->BRR = RELAY_PIN;
 }
 
-void apply_calibration(float * temp) {
-  if (thermo.cal_point1_temp == thermo.cal_point2_temp) return;
-  float slope = (thermo.cal_point2_measured - thermo.cal_point1_measured) /
-    (thermo.cal_point2_temp - thermo.cal_point1_temp);
-  * temp = thermo.cal_point1_measured + slope * ( * temp - thermo.cal_point1_temp);
+static void relay_set(uint8_t on) {
+    if (on != thermo.relay_state) {
+        thermo.relay_state = on;
+        thermo.relay_last_switch = tick_count;
+        if (on) {
+            thermo.relay_cycles++;
+        } else {
+            thermo.relay_last_off = tick_count;
+            thermo.relay_off_valid = 1;
+        }
+        thermo.update_display = 1;
+    }
+    // The pin is refreshed on every call: this also applies a changed NO/NC setting at once
+    relay_output(thermo.relay_state);
 }
 
-void update_onoff_thermostat(void) {
-    uint8_t new_state = thermo.relay_state;
+// ==================== Thermostat logic ====================
 
-    // Вычисляем желаемое состояние реле в зависимости от режима (нагрев/охлаждение)
-    if (thermo.mode == 0) { // Нагрев
-        if (thermo.current_temp < (thermo.setpoint - thermo.hysteresis))
-            new_state = 1;
-        else if (thermo.current_temp >= thermo.setpoint)
-            new_state = 0;
-    } else { // Охлаждение
-        if (thermo.current_temp > (thermo.setpoint + thermo.hysteresis))
-            new_state = 1;
-        else if (thermo.current_temp <= thermo.setpoint)
-            new_state = 0;
+// Setpoint that is active now (day/night one when the schedule is enabled)
+static const param_desc_t* active_setpoint_param(void) {
+    if (!thermo.schedule_enabled) return &P_SETPOINT;
+
+    uint8_t hour = thermo.clock_minutes / 60;
+    uint8_t day_h = thermo.day_start_hour, night_h = thermo.night_start_hour;
+    bool is_day = (day_h <= night_h) ? (hour >= day_h && hour < night_h)
+                                     : (hour >= day_h || hour < night_h); // day period crosses midnight
+    return is_day ? &P_DAY_SP : &P_NIGHT_SP;
+}
+
+static float active_setpoint(void) {
+    return *(const float*)active_setpoint_param()->value;
+}
+
+static float apply_temp_filter(float new_temp) {
+    // First valid measurement initializes the filter (no slow start from a wrong value)
+    if (thermo.temp_filter == 0 || thermo.temp_filter >= 10 || !thermo.temp_valid) return new_temp;
+    float alpha = thermo.temp_filter / 10.0f;
+    return alpha * new_temp + (1.0f - alpha) * thermo.current_temp;
+}
+
+// Two-point calibration: at the reference temperature T the sensor showed M.
+// Maps the measured value to the real one: T = T1 + (M - M1) * (T2 - T1) / (M2 - M1)
+static float apply_calibration(float measured) {
+    float dm = thermo.cal_point2_measured - thermo.cal_point1_measured;
+    if (dm < 0.1f && dm > -0.1f) return measured; // points are not set or invalid
+    return thermo.cal_point1_temp +
+           (measured - thermo.cal_point1_measured) * (thermo.cal_point2_temp - thermo.cal_point1_temp) / dm;
+}
+
+static void pid_reset(void) {
+    thermo.integral = 0;
+    thermo.previous_error = 0;
+    thermo.pid_output = 0;
+    thermo.pwm_on_ms = 0;
+    // Compute PID and start a new PWM period on the very next call
+    thermo.last_pid_time = tick_count - thermo.pid_interval;
+    thermo.pwm_cycle_start = tick_count - (uint32_t)thermo.pwm_period * 1000;
+}
+
+static float compute_pid(float setpoint, float current) {
+    // Error sign depends on the mode: heating wants T to rise, cooling wants it to fall
+    float error = (thermo.mode == 0) ? (setpoint - current) : (current - setpoint);
+    float limit = thermo.pid_output_limit;
+
+    thermo.integral += error * thermo.ki;
+    // Anti-windup
+    if (thermo.integral > limit) thermo.integral = limit;
+    if (thermo.integral < -limit) thermo.integral = -limit;
+
+    float deriv = thermo.kd * (error - thermo.previous_error);
+    thermo.previous_error = error;
+
+    float out = thermo.kp * error + thermo.integral + deriv;
+    if (out > limit) out = limit;
+    if (out < 0.0f) out = 0.0f;
+    return out;
+}
+
+// ON/OFF regulator with hysteresis, anti-chatter delay and compressor protection
+static uint8_t onoff_regulator(void) {
+    float sp = active_setpoint();
+    float t = thermo.current_temp;
+    uint8_t want = thermo.relay_state;
+
+    if (thermo.mode == 0) { // Heating
+        if (t < sp - thermo.hysteresis) want = 1;
+        else if (t >= sp) want = 0;
+    } else {                // Cooling
+        if (t > sp + thermo.hysteresis) want = 1;
+        else if (t <= sp) want = 0;
     }
 
-    // Если состояние изменилось, проверяем задержку между переключениями
-    if (new_state != thermo.relay_state) {
-        // Защита от слишком частого переключения (relay_delay в секундах)
-        if (thermo.relay_delay > 0 && 
-            (tick_count - thermo.relay_last_switch) < (uint32_t)thermo.relay_delay * 1000) {
-            return; // Ещё не прошло relay_delay секунд – игнорируем смену состояния
-        }
+    if (want == thermo.relay_state) return want;
 
-        // Обновляем время последнего переключения
-        thermo.relay_last_switch = tick_count;
+    // Minimal time between any two switches
+    if (thermo.relay_delay &&
+        tick_count - thermo.relay_last_switch < (uint32_t)thermo.relay_delay * 1000) {
+        return thermo.relay_state;
+    }
+    // Minimal OFF time before switching on again (compressor protection)
+    if (want && thermo.cycle_protection && thermo.relay_off_valid &&
+        tick_count - thermo.relay_last_off < (uint32_t)thermo.cycle_protection * 60000) {
+        return thermo.relay_state;
+    }
+    return want;
+}
 
-        // Меняем состояние реле
-        thermo.relay_state = new_state;
-        if (thermo.relay_logic == 0) { // Normally Open (NO)
-            if (thermo.relay_state) RELAY_PORT->BSRR = RELAY_PIN;
-            else RELAY_PORT->BRR = RELAY_PIN;
-        } else { // Normally Closed (NC)
-            if (thermo.relay_state) RELAY_PORT->BRR = RELAY_PIN;
-            else RELAY_PORT->BSRR = RELAY_PIN;
-        }
+// PID regulator with slow PWM (time-proportional) relay output
+static uint8_t pid_regulator(void) {
+    if (tick_count - thermo.last_pid_time >= thermo.pid_interval) {
+        thermo.last_pid_time = tick_count;
+        float out = compute_pid(active_setpoint(), thermo.current_temp);
+        if ((uint8_t)(out + 0.5f) != (uint8_t)(thermo.pid_output + 0.5f)) thermo.update_display = 1;
+        thermo.pid_output = out;
+    }
 
-        // Увеличиваем счётчик циклов и запрашиваем обновление дисплея
-        thermo.relay_cycles++;
+    // The ON time is latched at the start of each PWM period, so PID updates
+    // in the middle of a period do not make the relay chatter
+    uint32_t period_ms = (uint32_t)thermo.pwm_period * 1000;
+    uint32_t elapsed = tick_count - thermo.pwm_cycle_start;
+    if (elapsed >= period_ms) {
+        thermo.pwm_cycle_start = tick_count;
+        elapsed = 0;
+        thermo.pwm_on_ms = (uint32_t)(thermo.pid_output * (float)period_ms / 100.0f);
+    }
+    return elapsed < thermo.pwm_on_ms;
+}
+
+// Decides the relay state, called on every main loop iteration
+static void control_task(void) {
+    static uint8_t last_regulator = 0xFF, last_mode = 0xFF;
+    uint8_t want;
+
+    // Restart PID when the regulator or the mode changes
+    if (thermo.regulator_type != last_regulator || thermo.mode != last_mode) {
+        last_regulator = thermo.regulator_type;
+        last_mode = thermo.mode;
+        pid_reset();
+    }
+
+    uint8_t tripped = thermo.safety_enabled && thermo.temp_valid &&
+                      (thermo.current_temp < thermo.temp_min || thermo.current_temp > thermo.temp_max);
+    if (tripped != thermo.safety_tripped) {
+        thermo.safety_tripped = tripped;
         thermo.update_display = 1;
+        if (tripped) beep(500);
+    }
 
-        // Короткий звуковой сигнал (для пассивного бузера – сгенерированный тон)
+    if (thermo.manual_mode == 1) {
+        want = 1;
+    } else if (thermo.manual_mode == 2) {
+        want = 0;
+    } else if (!thermo.temp_valid || thermo.safety_tripped) {
+        want = 0; // fail-safe: no temperature or limits violated -> load off
+    } else if (thermo.regulator_type == 0) {
+        want = onoff_regulator();
+    } else {
+        want = pid_regulator();
+    }
+
+    // Short beep on switching (not in PID mode where the relay switches every PWM period)
+    if (want != thermo.relay_state && (thermo.regulator_type == 0 || thermo.manual_mode != 0)) {
         beep(50);
     }
+    relay_set(want);
 }
 
-float compute_pid(float setpoint, float current) {
-  // Правильный расчет ошибки для нагрева и охлаждения
-  float error = (thermo.mode == 0) ? (setpoint - current) : (current - setpoint);
+// ==================== Temperature sensor (non-blocking) ====================
 
-  float prop = thermo.kp * error;
-  thermo.integral += error * thermo.ki;
-
-  if (thermo.integral > thermo.pid_output_limit) thermo.integral = thermo.pid_output_limit;
-  if (thermo.integral < -thermo.pid_output_limit) thermo.integral = -thermo.pid_output_limit;
-
-  float deriv = thermo.kd * (error - thermo.previous_error);
-  thermo.previous_error = error;
-
-  float out = prop + thermo.integral + deriv;
-  if (out > thermo.pid_output_limit) out = thermo.pid_output_limit;
-  if (out < 0.0f) out = 0.0f;
-  return out;
+static void sensor_failed(void) {
+    if (thermo.sensor_fail_count < 255) thermo.sensor_fail_count++;
+    if (thermo.sensor_fail_count >= SENSOR_FAIL_LIMIT && !thermo.sensor_error) {
+        thermo.sensor_error = 1;
+        thermo.temp_valid = 0;     // control_task switches the load off
+        thermo.ds_resolution = 0;  // re-apply the resolution when the sensor is back
+        thermo.update_display = 1;
+        beep(500);
+    }
 }
 
-void update_pid_thermostat(void) {
-  if (tick_count - thermo.last_pid_time >= thermo.pid_interval) {
-    thermo.last_pid_time = tick_count;
-    float out = compute_pid(thermo.setpoint, thermo.current_temp);
-    thermo.pwm_on_time = (uint16_t)(out * thermo.pwm_period / 100.0f);
-    thermo.pwm_cycle_start = tick_count;
-    thermo.update_display = 1;
-  }
+static void sensor_task(void) {
+    static uint32_t start_timer;
+    static uint8_t started = 0;
 
-  uint32_t cycle_time = (tick_count - thermo.pwm_cycle_start) / 1000;
-  uint8_t new_state = (cycle_time < thermo.pwm_on_time) ? 1 : 0;
+    if (thermo.ds_pending) {
+        if (tick_count - thermo.ds_start_time < ds18b20_conversion_time_ms(thermo.ds_resolution)) return;
+        thermo.ds_pending = 0;
 
-  if (cycle_time >= thermo.pwm_period) {
-    thermo.pwm_cycle_start = tick_count;
-    new_state = (thermo.pwm_on_time > 0) ? 1 : 0;
-  }
+        int16_t raw;
+        if (!ds18b20_read_raw(&raw)) {
+            sensor_failed();
+            return;
+        }
 
-  if (new_state != thermo.relay_state) {
-    thermo.relay_state = new_state;
-    if (thermo.relay_logic == 0) {
-      if (thermo.relay_state) RELAY_PORT -> BSRR = RELAY_PIN;
-      else RELAY_PORT -> BRR = RELAY_PIN;
+        float t = apply_calibration(raw / 16.0f) + thermo.calibration;
+        thermo.current_temp = apply_temp_filter(t);
+        thermo.temp_valid = 1;
+        thermo.sensor_error = 0;
+        thermo.sensor_fail_count = 0;
+        thermo.update_display = 1;
+        return;
+    }
+
+    if (started && tick_count - start_timer < (uint32_t)thermo.update_interval * 1000) return;
+    started = 1;
+    start_timer = tick_count;
+
+    // Apply a new resolution (after start-up, menu change or sensor reconnection)
+    if (thermo.ds_resolution != thermo.temp_resolution) {
+        if (!ds18b20_set_resolution(thermo.temp_resolution)) {
+            sensor_failed();
+            return;
+        }
+        thermo.ds_resolution = thermo.temp_resolution;
+    }
+
+    if (ds18b20_start_conversion()) {
+        thermo.ds_pending = 1;
+        thermo.ds_start_time = tick_count;
     } else {
-      if (thermo.relay_state) RELAY_PORT -> BRR = RELAY_PIN;
-      else RELAY_PORT -> BSRR = RELAY_PIN;
+        sensor_failed();
     }
-    thermo.relay_cycles++;
-    thermo.update_display = 1;
-    //beep(50);
-  }
 }
 
-void handle_manual_mode(void) {
-  if (thermo.manual_mode == 0) return;
-  uint8_t desired = (thermo.manual_mode == 1) ? 1 : 0;
-  if (desired != thermo.relay_state) {
-    thermo.relay_state = desired;
-    if (thermo.relay_logic == 0) {
-      if (thermo.relay_state) RELAY_PORT -> BSRR = RELAY_PIN;
-      else RELAY_PORT -> BRR = RELAY_PIN;
+// ==================== Display (8x2) ====================
+
+// Formats temperature in the selected units with one decimal
+static char* fmt_temp(char* dst, float celsius) {
+    if (thermo.temp_units) celsius = celsius * 9.0f / 5.0f + 32.0f;
+    float scaled = celsius * 10.0f;
+    return fmt_fixed(dst, (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f), 1);
+}
+
+// Right-aligns src in a field of the given width
+static char* put_right(char* dst, const char* src, uint8_t width) {
+    uint8_t len = (uint8_t)strlen(src);
+    while (len < width--) *dst++ = ' ';
+    return str_copy(dst, src);
+}
+
+static void update_main_display(void) {
+    char line[16];
+    char num[12];
+    char* p;
+
+    // --- Line 1: current temperature ---
+    if (thermo.sensor_error) {
+        str_copy(line, "Sens.Err");
+    } else if (!thermo.temp_valid) {
+        str_copy(line, " --.- ");
     } else {
-      if (thermo.relay_state) RELAY_PORT -> BRR = RELAY_PIN;
-      else RELAY_PORT -> BSRR = RELAY_PIN;
+        fmt_temp(num, thermo.current_temp);
+        p = put_right(line, num, 5);
+        *p++ = ' ';
+        *p++ = thermo.temp_units ? 'F' : 'C';
+        *p = '\0';
     }
-    thermo.update_display = 1;
-    beep(50);
-  }
-}
+    HD44780_print_line(&lcd, 0, line);
 
-void handle_schedule(void) {
-  if (!thermo.schedule_enabled) return;
-  thermo.current_hour = (thermo.uptime_minutes / 60) % 24;
-  if (thermo.current_hour >= thermo.day_start_hour && thermo.current_hour < thermo.night_start_hour)
-    thermo.setpoint = thermo.day_setpoint;
-  else
-    thermo.setpoint = thermo.night_setpoint;
-}
-
-bool check_safety_limits(void) {
-  if (!thermo.safety_enabled) return false;
-  if (thermo.current_temp < thermo.temp_min || thermo.current_temp > thermo.temp_max) {
-    if (thermo.relay_state && thermo.manual_mode == 0) {
-      thermo.relay_state = 0;
-      if (thermo.relay_logic == 0) RELAY_PORT -> BRR = RELAY_PIN;
-      else RELAY_PORT -> BSRR = RELAY_PIN;
-      thermo.update_display = 1;
-    }
-    return true; // Лимиты нарушены!
-  }
-  return false; // Все ок
-}
-
-// ==================== Неблокирующее чтение DS18B20 ====================
-void thermostat_start_conversion(void) {
-  if (thermo.ds_pending) return;
-  ds18b20_start_conversion();
-  thermo.ds_pending = 1;
-}
-
-void thermostat_process(void) {
-  if (!thermo.ds_pending) return;
-  if (!ds18b20_is_conversion_done()) return;
-
-  float raw = ds18b20_read_result();
-  if (raw <= -273.0f) return; // Игнор ошибки датчика
-  
-  thermo.ds_pending = 0;
-
-  apply_calibration(&raw);
-  thermo.current_temp = apply_temp_filter(raw + thermo.calibration);
-
-  // Если сработала защита, термостат блокируется!
-  if (check_safety_limits()) {
-      // Ничего не делаем, реле уже выключено функцией защиты
-  } 
-  
-  handle_schedule();
-
-  if (thermo.manual_mode != 0) {
-    handle_manual_mode();
-  } else {
-    if (thermo.regulator_type == 0) update_onoff_thermostat();
-    else update_pid_thermostat();
-  }
-  thermo.update_display = 1;
-}
-
-// ==================== Отрисовка Дисплея (8x2 Строго) ====================
-
-void convert_temperature(float * temp) {
-  if (thermo.temp_units) * temp = * temp * 9.0f / 5.0f + 32.0f;
-}
-
-void update_main_display(void) {
-  char buf[12];
-  char temp_str[8];
-  float disp_temp = thermo.current_temp, disp_set = thermo.setpoint;
-
-  // Конвертируем значения (в C или F)
-  convert_temperature(&disp_temp);
-  convert_temperature(&disp_set);
-
-  HD44780_clear(&lcd);
-
-  // --- СТРОКА 1: Текущая температура ---
-  // Используем функцию для перевода float в строку "XX.X"
-  format_float_to_str(temp_str, sizeof(temp_str), disp_temp);
-  
-  HD44780_cursor_to(&lcd, 0, 0);
-  mini_snprintf(buf, sizeof(buf), "%5s %c", temp_str, thermo.temp_units ? 'F' : 'C');
-  HD44780_put_str(&lcd, buf);
-
-  // --- СТРОКА 2: Уставка или статус ---
-  HD44780_cursor_to(&lcd, 0, 1);
-  
-  if (thermo.manual_mode == 0) {
-    if (thermo.regulator_type == 0) {
-      // Режим обычного термостата (ON/OFF)
-      format_float_to_str(temp_str, sizeof(temp_str), disp_set);
-      // %4s дополнит строку уставки пробелами, %-3s выровняет статус влево
-      mini_snprintf(buf, sizeof(buf), "%4s %-3s", temp_str, thermo.relay_state ? "ON" : "OFF");
-      HD44780_put_str(&lcd, buf);
+    // --- Line 2: setpoint and state ---
+    if (thermo.manual_mode) {
+        str_copy(line, thermo.manual_mode == 1 ? " MAN ON" : " MAN OFF");
+    } else if (thermo.safety_tripped) {
+        str_copy(line, "LIMIT!");
+    } else if (thermo.regulator_type == 0) {
+        // "25.0 OFF"; the space is dropped for 5-character values ("-10.5OFF")
+        char* end = fmt_temp(num, active_setpoint());
+        p = put_right(line, num, 4);
+        if (end - num <= 4) *p++ = ' ';
+        str_copy(p, thermo.relay_state ? "ON" : "OFF");
     } else {
-      // Режим ПИД-регулятора
-      uint8_t power = (thermo.pwm_period > 0) ? ((thermo.pwm_on_time * 100) / thermo.pwm_period) : 0;
-      mini_snprintf(buf, sizeof(buf), "PWR:%3d%%", power);
-      HD44780_put_str(&lcd, buf);
+        p = str_copy(line, "PWR:");
+        fmt_uint(num, (uint32_t)(thermo.pid_output + 0.5f));
+        p = put_right(p, num, 3);
+        str_copy(p, "%");
     }
-  } else {
-    // Ручной режим (просто выводим готовую строку)
-    HD44780_put_str(&lcd, thermo.manual_mode == 1 ? " MAN ON " : " MAN OFF");
-  }
-
-  thermo.update_display = 0;
+    HD44780_print_line(&lcd, 1, line);
 }
 
-void update_menu_display(void) {
-  if (global_menu_state.edit_mode && current_edit_value) {
-    HD44780_clear(&lcd);
-    HD44780_cursor_to(&lcd, 0, 0);
-    const menu_item_t * item = &global_menu_state.current_menu[global_menu_state.selected_index];
-    HD44780_put_str(&lcd, item -> text);
+static void display_refresh(void) {
+    if (!thermo.display_on) return;
+    if (menu_is_open(&menu)) menu_draw(&menu, &lcd);
+    else update_main_display();
+    thermo.update_display = 0;
+}
 
-    HD44780_cursor_to(&lcd, 0, 1);
+// ==================== Settings storage ====================
 
-    if (current_edit_type == 0) { // float
-      format_float_to_str(edit_buffer, sizeof(edit_buffer), *(float * ) current_edit_value);
-      HD44780_put_str(&lcd, edit_buffer);
-    } else if (current_edit_type == 1) { // uint8
-      uint8_t value = * (uint8_t * ) current_edit_value;
-      if (current_edit_value == & thermo.manual_mode) {
-        HD44780_put_str(&lcd, (value == 0) ? "Auto" : ((value == 1) ? "Man On" : "Man Off"));
-      } else if (current_edit_value == & thermo.relay_logic) {
-        HD44780_put_str(&lcd, value ? "NC" : "NO");
-      } else if (current_edit_value == & thermo.temp_units) {
-        HD44780_put_str(&lcd, value ? "F" : "C");
-      } else if (current_edit_value == & thermo.mode) {
-        HD44780_put_str(&lcd, value ? "Cool" : "Heat");
-      } else if (current_edit_value == & thermo.regulator_type) {
-        HD44780_put_str(&lcd, value ? "PID" : "ON/OFF");
-      } else if (current_edit_value == & thermo.key_repeat || current_edit_value == & thermo.auto_save ||
-        current_edit_value == & thermo.beep_enabled || current_edit_value == & thermo.safety_enabled ||
-        current_edit_value == & thermo.schedule_enabled || current_edit_value == & thermo.power_save) {
-        HD44780_put_str(&lcd, value ? "On" : "Off");
-      } else {
-        mini_snprintf(edit_buffer, sizeof(edit_buffer), "%d", value);
-        HD44780_put_str(&lcd, edit_buffer);
-      }
-    } else if (current_edit_type == 2) { // uint16
-      uint16_t value = * (uint16_t * ) current_edit_value;
-      if (current_edit_value == & thermo.pwm_period) {
-        mini_snprintf(edit_buffer, sizeof(edit_buffer), "%ds", value);
-      } else if (current_edit_value == & thermo.key_repeat_delay || current_edit_value == & thermo.debounce_time) {
-        mini_snprintf(edit_buffer, sizeof(edit_buffer), "%dms", value);
-      } else {
-        mini_snprintf(edit_buffer, sizeof(edit_buffer), "%d", value);
-      }
-      HD44780_put_str(&lcd, edit_buffer);
-    } else if (current_edit_type == 3) { // uint32
-      mini_snprintf(edit_buffer, sizeof(edit_buffer), "%u", *(uint32_t * ) current_edit_value);
-      HD44780_put_str(&lcd, edit_buffer);
+static void save_if_changed(void) {
+    if (thermo.params_changed && thermo.auto_save) {
+        thermo.params_changed = 0;
+        save_parameters();
     }
-  } else {
-    menu_draw(&global_menu_state, &lcd);
-  }
 }
 
-void handle_display_timeout(void) {
-  if (thermo.display_timeout && thermo.display_on &&
-    tick_count - thermo.last_user_action > (uint32_t) thermo.display_timeout * 60000) {
-    thermo.display_on = 0;
-    HD44780_display_off(&lcd);
-  }
+static void sanitize_parameters(void) {
+    for (uint8_t i = 0; i < COUNT_OF(stored_params); i++) {
+        param_clamp(stored_params[i]);
+    }
 }
 
-// ==================== Статистика и Сохранение ====================
-void update_statistics(void) {
-  static uint32_t last = 0;
-  if (tick_count - last >= 60000) {
-    last = tick_count;
-    if (thermo.relay_state) thermo.total_runtime++;
-    thermo.uptime_minutes++;
-  }
-}
-
-void save_if_changed(void) {
-  if (thermo.params_changed && thermo.auto_save) {
+// Manual save (works also when auto-save is off)
+static void menu_save_action(void) {
     thermo.params_changed = 0;
     save_parameters();
-  }
+    beep(200);
 }
 
-// ==================== Опрос Кнопок и Лимиты параметров ====================
-
-// Безопасное редактирование значений (Ограничения)
-void modify_edit_value(int8_t dir) {
-  if (!current_edit_value) return;
-
-  if (current_edit_type == 0) { // float
-    float * v = (float * ) current_edit_value;
-    * v += dir * 0.5f;
-    if ( * v > 999.0f) * v = 999.0f;
-    if ( * v < -99.0f) * v = -99.0f;
-  } else if (current_edit_type == 1) { // uint8
-    uint8_t * v = (uint8_t * ) current_edit_value;
-    int16_t temp = * v + dir;
-
-    if (current_edit_value == & thermo.manual_mode) {
-      if (temp > 2) temp = (dir > 0) ? 2 : 0;
-      if (temp < 0) temp = 0;
-    } else if (
-      current_edit_value == & thermo.mode || current_edit_value == & thermo.regulator_type ||
-      current_edit_value == & thermo.relay_logic || current_edit_value == & thermo.temp_units ||
-      current_edit_value == & thermo.auto_save || current_edit_value == & thermo.beep_enabled ||
-      current_edit_value == & thermo.safety_enabled || current_edit_value == & thermo.schedule_enabled ||
-      current_edit_value == & thermo.power_save || current_edit_value == & thermo.display_metrics ||
-      current_edit_value == & thermo.display_rotation || current_edit_value == & thermo.key_repeat
-    ) {
-      if (temp > 1) temp = (dir > 0) ? 1 : 0;
-      if (temp < 0) temp = 0;
-    } else if (current_edit_value == & thermo.day_start_hour || current_edit_value == & thermo.night_start_hour) {
-      if (temp > 23) temp = (dir > 0) ? 23 : 0;
-      if (temp < 0) temp = 0;
-    } else {
-      if (temp > 255) temp = 255;
-      if (temp < 0) temp = 0;
+// Called when parameter editing is finished
+static void on_param_edited(const param_desc_t* p) {
+    if (p == &P_CLOCK) {
+        thermo.clock_minutes = (uint16_t)thermo.current_hour * 60;
+    } else if (p == &P_FACTORY && thermo.confirm) {
+        set_default_parameters();
+        save_parameters();
+        thermo.params_changed = 0;
+        menu_close(&menu);
+        beep(1000);
+    } else if (p == &P_CLEAR && thermo.confirm) {
+        thermo.total_runtime = 0;
+        thermo.relay_cycles = 0;
+        thermo.params_changed = 1;
+        save_if_changed();
+        beep(200);
     }
-    * v = (uint8_t) temp;
-  } else if (current_edit_type == 2) { // uint16
-    uint16_t * v = (uint16_t * ) current_edit_value;
-    int32_t temp = * v + dir;
-
-    if (current_edit_value == & thermo.pwm_period) {
-      if (temp < 1) temp = 1; // Нельзя делить на ноль!
-    }
-    if (temp > 65535) temp = 65535;
-    if (temp < 0) temp = 0;
-
-    * v = (uint16_t) temp;
-  }
+    thermo.confirm = 0;
 }
 
-uint8_t is_button_pressed(uint16_t pin, uint32_t * last_press, uint32_t * last_repeat,
-  uint8_t * state, uint8_t * debounced) {
-  #ifdef DEBUG_BUTTONS
-  uint8_t raw;
-  if (pin == BTN_UP_PIN)
-    raw = virtual_btn_up;
-  else if (pin == BTN_DOWN_PIN)
-    raw = virtual_btn_down;
-  else if (pin == BTN_ENTER_PIN)
-    raw = virtual_btn_enter;
-  else
-    raw = 0;
-  #else
-  uint8_t raw = ((BTN_PORT -> IDR & pin) == 0) ? 1 : 0;
-  #endif
+// ==================== Statistics and clock ====================
 
-  // 1. Если физическое состояние пина изменилось (пошел дребезг или нажатие)
-  // Обновляем состояние и сбрасываем таймер
-  if (raw != * state) {
-    * last_press = tick_count;
-    * state = raw;
-  }
+static void statistics_task(void) {
+    static uint32_t minute_timer = 0;
+    if (tick_count - minute_timer < 60000) return;
+    minute_timer += 60000; // no accumulated drift
 
-  // 2. Проверяем, оставался ли сигнал стабильным нужное время
-  if ((tick_count - * last_press) >= thermo.debounce_time) {
+    if (thermo.relay_state) thermo.total_runtime++;
 
-    // Если стабильное состояние отличается от того, что мы уже зафиксировали
-    if (raw != * debounced) {
-      * debounced = raw; // Сохраняем новое уверенное состояние
-
-      // Если это уверенное нажатие (а не отпускание)
-      if ( * debounced == 1) {
-        * last_repeat = tick_count; // Готовим таймер для автоповтора
-        return 1; // Выдаем одиночный импульс нажатия
-      }
+    thermo.clock_minutes++;
+    if (thermo.clock_minutes >= 24 * 60) thermo.clock_minutes = 0;
+    // Do not overwrite the hour while the user is editing it
+    if (menu_edit_param(&menu) != &P_CLOCK) {
+        thermo.current_hour = thermo.clock_minutes / 60;
     }
-  }
+    if (thermo.schedule_enabled) thermo.update_display = 1;
+}
 
-  // 3. Обработка долгого удержания (автоповтор)
-  if ( * debounced == 1 && thermo.key_repeat) {
-    // Отсчитываем начальную задержку удержания от момента стабилизации (*last_press)
-    if ((tick_count - * last_press) > thermo.key_repeat_delay) {
+// ==================== Buttons ====================
 
-      // Генерируем повторные срабатывания с нужным интервалом
-      if ((tick_count - * last_repeat) > thermo.key_repeat_rate) {
-        * last_repeat = tick_count;
+static uint8_t button_read(uint16_t pin) {
+#ifdef DEBUG_BUTTONS
+    if (pin == BTN_UP_PIN) return virtual_btn_up;
+    if (pin == BTN_DOWN_PIN) return virtual_btn_down;
+    if (pin == BTN_ENTER_PIN) return virtual_btn_enter;
+    return 0;
+#else
+    return (BTN_PORT->IDR & pin) ? 0 : 1; // active low
+#endif
+}
+
+// Returns 1 on a debounced press and on every auto-repeat event
+static uint8_t button_poll(button_t* b) {
+    uint8_t raw = button_read(b->pin);
+    uint32_t now = tick_count;
+
+    // Level changed (press, release or bounce): restart the debounce timer
+    if (raw != b->raw) {
+        b->raw = raw;
+        b->last_change = now;
+        return 0;
+    }
+    if (now - b->last_change < thermo.debounce_time) return 0;
+
+    // Stable new state
+    if (raw != b->pressed) {
+        b->pressed = raw;
+        b->repeat_count = 0;
+        if (raw) {
+            b->last_event = now;
+            return 1;
+        }
+        return 0;
+    }
+
+    // Auto-repeat while held
+    if (raw && b->allow_repeat && thermo.key_repeat &&
+        now - b->last_change >= thermo.key_repeat_delay &&
+        now - b->last_event >= thermo.key_repeat_rate) {
+        b->last_event = now;
+        if (b->repeat_count < 255) b->repeat_count++;
         return 1;
-      }
     }
-  }
-
-  return 0;
+    return 0;
 }
 
-void button_up_action(void) {
-  thermo.last_user_action = tick_count;
-  if (!thermo.display_on) {
+// Returns true if the key press was used only to wake up the display
+static bool wake_display(void) {
+    thermo.last_user_action = tick_count;
+    if (thermo.display_on) return false;
     thermo.display_on = 1;
     HD44780_display_on(&lcd);
-    return;
-  }
-
-  if (global_menu_state.current_menu == NULL) {
-    if (thermo.manual_mode == 0) {
-      thermo.setpoint += 0.5f;
-      thermo.params_changed = 1;
-      thermo.update_display = 1;
-    }
-  } else {
-    if (global_menu_state.edit_mode && current_edit_value) {
-      modify_edit_value(1);
-      thermo.params_changed = 1;
-      update_menu_display();
-    } else if (!global_menu_state.edit_mode) {
-      menu_handle_up(&global_menu_state);
-      update_menu_display();
-    }
-  }
-  beep(30);
+    thermo.update_display = 1;
+    return true;
 }
 
-void button_down_action(void) {
-  thermo.last_user_action = tick_count;
-  if (!thermo.display_on) {
-    thermo.display_on = 1;
-    HD44780_display_on(&lcd);
-    return;
-  }
+static void button_updown_action(int8_t dir, uint8_t accel) {
+    if (wake_display()) return;
 
-  if (global_menu_state.current_menu == NULL) {
-    if (thermo.manual_mode == 0) {
-      thermo.setpoint -= 0.5f;
-      thermo.params_changed = 1;
-      thermo.update_display = 1;
-    }
-  } else {
-    if (global_menu_state.edit_mode && current_edit_value) {
-      modify_edit_value(-1);
-      thermo.params_changed = 1;
-      update_menu_display();
-    } else if (!global_menu_state.edit_mode) {
-      menu_handle_down(&global_menu_state);
-      update_menu_display();
-    }
-  }
-  beep(30);
-}
-
-void button_enter_action(void) {
-  thermo.last_user_action = tick_count;
-  if (!thermo.display_on) {
-    thermo.display_on = 1;
-    HD44780_display_on(&lcd);
-    return;
-  }
-
-  if (global_menu_state.current_menu == NULL) {
-    global_menu_state.current_menu = main_menu;
-    global_menu_state.menu_item_count = COUNT_OF(main_menu);
-    global_menu_state.selected_index = 0;
-    global_menu_state.scroll_offset = 0;
-    global_menu_state.edit_mode = 0;
-    update_menu_display();
-  } else {
-    if (global_menu_state.edit_mode) {
-      global_menu_state.edit_mode = 0;
-      current_edit_value = NULL;
-      update_menu_display();
+    if (!menu_is_open(&menu)) {
+        // Main screen: change the active setpoint
+        if (thermo.manual_mode == 0 && param_step(active_setpoint_param(), dir, 1)) {
+            thermo.params_changed = 1;
+        }
     } else {
-      menu_handle_enter(&global_menu_state);
+        menu_event_t evt = (dir > 0) ? menu_handle_up(&menu, accel) : menu_handle_down(&menu, accel);
+        const param_desc_t* p = menu_edit_param(&menu);
+        if (evt == MENU_EVT_CHANGED && p && !(p->flags & PF_NOSAVE)) {
+            thermo.params_changed = 1;
+        }
     }
-  }
-  beep(50);
+    display_refresh();
+    beep(30);
 }
 
-void handle_buttons_with_debounce(void) {
-  if (is_button_pressed(BTN_UP_PIN, & thermo.btn_up_last_press, & thermo.btn_up_last_repeat, &
-      thermo.btn_up_state, & thermo.btn_up_debounced)) {
-    button_up_action();
-  }
+static void button_enter_action(void) {
+    if (wake_display()) return;
 
-  if (is_button_pressed(BTN_DOWN_PIN, & thermo.btn_down_last_press, & thermo.btn_down_last_repeat, &
-      thermo.btn_down_state, & thermo.btn_down_debounced)) {
-    button_down_action();
-  }
-
-  if (is_button_pressed(BTN_ENTER_PIN, & thermo.btn_enter_last_press, & thermo.btn_enter_last_repeat, &
-      thermo.btn_enter_state, & thermo.btn_enter_debounced)) {
-    button_enter_action();
-  }
+    if (!menu_is_open(&menu)) {
+        menu_open(&menu, main_menu, COUNT_OF(main_menu));
+    } else {
+        const param_desc_t* p = menu_edit_param(&menu);
+        menu_event_t evt = menu_handle_enter(&menu);
+        if (evt == MENU_EVT_EDIT_END) {
+            on_param_edited(p);
+        } else if (evt == MENU_EVT_EXIT) {
+            save_if_changed();
+        }
+    }
+    display_refresh();
+    beep(50);
 }
 
-// ==================== Прерывание системного таймера ====================
+static void buttons_task(void) {
+    if (button_poll(&btn_up)) {
+        button_updown_action(1, (btn_up.repeat_count > KEY_ACCEL_REPEATS) ? 10 : 1);
+    }
+    if (button_poll(&btn_down)) {
+        button_updown_action(-1, (btn_down.repeat_count > KEY_ACCEL_REPEATS) ? 10 : 1);
+    }
+    if (button_poll(&btn_enter)) {
+        button_enter_action();
+    }
+}
+
+// Menu and display inactivity timeouts
+static void ui_timeout_task(void) {
+    uint32_t idle = tick_count - thermo.last_user_action;
+
+    if (menu_is_open(&menu) && idle > MENU_TIMEOUT_MS) {
+        const param_desc_t* p = menu_edit_param(&menu);
+        if (p) on_param_edited(p == &P_FACTORY || p == &P_CLEAR ? NULL : p); // never confirm by timeout
+        menu_close(&menu);
+        save_if_changed();
+        thermo.update_display = 1;
+    }
+
+    if (thermo.display_timeout && thermo.display_on &&
+        idle > (uint32_t)thermo.display_timeout * 60000) {
+        thermo.display_on = 0;
+        HD44780_display_off(&lcd);
+    }
+}
+
+// ==================== System timer interrupt ====================
 void SysTick_Handler(void) {
-  tick_count++;
+    tick_count++;
 }
 
-// ==================== Главный цикл (main) ====================
+// ==================== Main loop ====================
 int main(void) {
-  system_clock_init();
+    system_clock_init();
 
-  // SysTick ДОЛЖЕН быть инициализирован ДО портов, чтобы заработали задержки 1-Wire датчика
-  systick_init();
-  gpio_init();
-  beep_timer_init();
+    // SysTick MUST be initialized first: delay_us() used by the LCD and 1-Wire depends on it
+    systick_init();
+    watchdog_init();
 
-  load_parameters();
+    // Parameters are loaded before GPIO: the relay logic (NO/NC) defines the safe pin level
+    load_parameters();
+    sanitize_parameters();
 
-  thermo.relay_state = 0;
-  thermo.update_display = 1;
-  thermo.params_changed = 0;
-  thermo.last_user_action = tick_count;
-  thermo.display_on = 1;
-  thermo.filtered_temp = thermo.setpoint;
-  thermo.relay_last_switch = tick_count;
-  thermo.integral = 0;
-  thermo.previous_error = 0;
-  thermo.last_pid_time = tick_count;
-  thermo.pwm_cycle_start = tick_count;
-  thermo.pwm_on_time = 0;
-  thermo.uptime_minutes = 0;
-  thermo.ds_pending = 0;
+    gpio_init();
+    beep_timer_init();
 
-  // Инициализация дисплея
-  uint16_t data_pins[4] = {
-    LCD_D4_PIN,
-    LCD_D5_PIN,
-    LCD_D6_PIN,
-    LCD_D7_PIN
-  };
-  HD44780_init( & lcd, GPIOA, data_pins, GPIOA, LCD_RS_PIN, LCD_E_PIN);
+    thermo.relay_state = 0;
+    thermo.update_display = 1;
+    thermo.params_changed = 0;
+    thermo.last_user_action = tick_count;
+    thermo.display_on = 1;
+    thermo.relay_last_switch = tick_count;
+    thermo.current_hour = thermo.clock_minutes / 60;
 
-  menu_init( & global_menu_state, main_menu, COUNT_OF(main_menu));
-  global_menu_state.current_menu = NULL;
+    uint16_t data_pins[4] = {LCD_D4_PIN, LCD_D5_PIN, LCD_D6_PIN, LCD_D7_PIN};
+    HD44780_init(&lcd, GPIOA, data_pins, GPIOA, LCD_RS_PIN, LCD_E_PIN);
+    menu_close(&menu);
 
-  ds18b20_init();
-  set_ds18b20_resolution(thermo.temp_resolution);
+    ds18b20_init();
 
-  beep(200);
+    beep(200);
 
-  // Таймеры задач
-  static uint32_t temp_timer = 0, disp_timer = 0, save_timer = 0, btn_timer = 0;
+    uint32_t btn_timer = 0, disp_timer = 0;
 
-  while (1) {
-    // Задача 1: Запуск датчика температуры
-    if (tick_count - temp_timer >= (uint32_t) thermo.update_interval * 1000) {
-      temp_timer = tick_count;
-      thermostat_start_conversion();
+    while (1) {
+        watchdog_feed();
+
+        // Temperature measurement and relay control
+        sensor_task();
+        control_task();
+
+        // Buttons are polled every BUTTON_POLL_MS
+        if (tick_count - btn_timer >= BUTTON_POLL_MS) {
+            btn_timer = tick_count;
+            buttons_task();
+        }
+
+        statistics_task();
+        ui_timeout_task();
+
+        // Display is redrawn only when something changed
+        if (thermo.update_display && thermo.display_on && tick_count - disp_timer >= DISPLAY_REFRESH_MS) {
+            disp_timer = tick_count;
+            display_refresh();
+        }
+
+        // Delayed auto-save: SAVE_DELAY_MS after the last key press and outside the menu
+        if (thermo.params_changed && thermo.auto_save && !menu_is_open(&menu) &&
+            tick_count - thermo.last_user_action >= SAVE_DELAY_MS) {
+            save_if_changed();
+        }
+
+        // Sleep until the next interrupt (SysTick wakes the core every 1 ms)
+        if (thermo.power_save) __WFI();
     }
-
-    // Задача 2: Опрос датчика
-    thermostat_process();
-
-    // Задача 3: Отрисовка дисплея (каждые 500мс)
-    if (thermo.update_display && thermo.display_on && (tick_count - disp_timer >= 500)) {
-      disp_timer = tick_count;
-      if (global_menu_state.current_menu == NULL) update_main_display();
-      else update_menu_display();
-    }
-
-    // Задача 4: Опрос кнопок не блокируя цикл (каждые 5мс)
-    if (tick_count - btn_timer >= 5) {
-      btn_timer = tick_count;
-      handle_buttons_with_debounce();
-    }
-
-    // Задача 5: Фоновые процессы
-    update_statistics();
-    handle_display_timeout();
-
-    // Задача 6: Отложенное сохранение настроек во Flash (раз в 10 секунд при изменениях)
-    if (thermo.params_changed && thermo.auto_save && (tick_count - save_timer >= 10000)) {
-      save_timer = tick_count;
-      save_if_changed();
-    }
-  }
 }
