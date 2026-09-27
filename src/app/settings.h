@@ -34,8 +34,7 @@ typedef struct {
     int16_t temp_min;           // alarm limits
     int16_t temp_max;
     int16_t alarm_hyst;         // alarm release hysteresis
-    int16_t day_setpoint;
-    int16_t night_setpoint;
+    int16_t reserved_sp[2];     // unused (schedule removed), kept for layout compatibility
     int16_t cal_p1_ref;         // two-point calibration: at reference ref the sensor showed meas
     int16_t cal_p1_meas;
     int16_t cal_p2_ref;
@@ -67,9 +66,7 @@ typedef struct {
     uint8_t sensor_source;      // SRC_xxx
     uint8_t relay_delay;        // s, minimal time between relay switches
     uint8_t cycle_protection;   // min, minimal relay OFF time
-    uint8_t schedule_enabled;
-    uint8_t day_start_hour;
-    uint8_t night_start_hour;
+    uint8_t reserved_sched[3];  // unused (schedule removed), kept for layout compatibility
     uint8_t auto_save;
     uint8_t beep_enabled;       // key clicks and short signals
     uint8_t power_save;         // sleep between main loop iterations

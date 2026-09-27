@@ -53,8 +53,7 @@ typedef struct {
     // Auto-tuning
     autotune_t tune;
 
-    // Clock for the schedule (no RTC on this board: runs from the internal oscillator)
-    uint16_t clock_minutes;     // 0..1439
+    uint16_t day_minutes;       // minutes since the daily min/max were restarted
 
     // Flags for the user interface
     uint8_t update_display;
@@ -69,8 +68,6 @@ void thermostat_task(void);             // call from the main loop
 
 void beep(uint16_t duration_ms);        // key click / short signal (respects beep_enabled)
 
-bool thermostat_is_day(void);           // schedule: day period active
-int16_t thermostat_active_setpoint(void);
 bool thermostat_alarm_active(void);
 bool thermostat_acknowledge(void);      // key press on the main screen: mute / acknowledge, true if consumed
 void thermostat_mute(void);

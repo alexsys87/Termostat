@@ -13,7 +13,6 @@ static uint32_t last_user_action;
 // Staging values edited in the menu and applied when editing is finished
 static uint8_t ui_confirm;      // Yes/No for dangerous actions
 static uint8_t ui_tune;         // auto-tuning on/off
-static uint8_t ui_hour;         // clock hour
 
 // ==================== Buttons ====================
 typedef struct {
@@ -75,13 +74,6 @@ static const param_desc_t P_KD        = P_U16(kd, 0, 30000, 1, 0, UNIT_NONE);   
 static const param_desc_t P_PWM_PER   = P_U16(pwm_period, 1, 600, 1, 0, UNIT_S);
 static const param_desc_t P_PID_LIM   = P_U8(pid_output_limit, 1, 100, 1, UNIT_PERCENT);
 static const param_desc_t P_TUNE      = {&ui_tune, LBL_OFF_ON, 0, 1, 1, PARAM_U8, 0, PF_NOSAVE, UNIT_NONE};
-// Schedule
-static const param_desc_t P_SCHEDULE  = P_ENUM(schedule_enabled, LBL_OFF_ON);
-static const param_desc_t P_TIME      = {&ui_hour, NULL, 0, 23, 1, PARAM_U8, 0, PF_NOSAVE, UNIT_H};
-static const param_desc_t P_DAY_SP    = P_TEMP(day_setpoint, 5);
-static const param_desc_t P_NIGHT_SP  = P_TEMP(night_setpoint, 5);
-static const param_desc_t P_DAY_H     = P_U8(day_start_hour, 0, 23, 1, UNIT_H);
-static const param_desc_t P_NIGHT_H   = P_U8(night_start_hour, 0, 23, 1, UNIT_H);
 // Sensor
 static const param_desc_t P_SOURCE    = P_ENUM(sensor_source, LBL_SOURCE);
 static const param_desc_t P_FOUND     = P_VIEW(thermo.sensor_count, PARAM_U8, UNIT_NONE);
@@ -153,16 +145,6 @@ MENU_ITEMS(pid_menu) = {
     MENU_BACK("Back")
 };
 
-MENU_ITEMS(schedule_menu) = {
-    MENU_PARAM("Sch", P_SCHEDULE),
-    MENU_PARAM("Time", P_TIME),
-    MENU_PARAM("Day", P_DAY_SP),
-    MENU_PARAM("Night", P_NIGHT_SP),
-    MENU_PARAM("DSta", P_DAY_H),
-    MENU_PARAM("NSta", P_NIGHT_H),
-    MENU_BACK("Back")
-};
-
 MENU_ITEMS(sensor_menu) = {
     MENU_PARAM("Src", P_SOURCE),
     MENU_PARAM("Found", P_FOUND),
@@ -213,7 +195,6 @@ MENU_ITEMS(main_menu) = {
     MENU_NODE("Basic", basic_menu),
     MENU_NODE("Alarm", alarm_menu),
     MENU_NODE("PID", pid_menu),
-    MENU_NODE("Sched", schedule_menu),
     MENU_NODE("Sensor", sensor_menu),
     MENU_NODE("Cal", calibration_menu),
     MENU_NODE("Sys", system_menu),
@@ -272,7 +253,7 @@ static void update_main_display(void) {
         str_copy(line, "LIM ACK?");
     } else if (thermo.cfg.regulator_type == 0) {
         // "25.0 OFF"; the space is dropped for 5-character values ("-10.5OFF")
-        char* end = fmt_temp_number(num, thermostat_active_setpoint());
+        char* end = fmt_temp_number(num, thermo.cfg.setpoint);
         p = put_right(line, num, 4);
         if (end - num <= 4) *p++ = ' ';
         str_copy(p, thermo.relay_state ? "ON" : "OFF");
@@ -314,15 +295,11 @@ static void menu_scan_action(void) {
 static void on_edit_begin(void) {
     ui_confirm = 0;
     ui_tune = (thermo.tune.state == TUNE_RUNNING);
-    ui_hour = (uint8_t)(thermo.clock_minutes / 60);
 }
 
 // Applies staging values when editing is finished (by_timeout: never confirm dangerous actions)
 static void on_edit_end(const param_desc_t* p, bool by_timeout) {
-    if (p == &P_TIME) {
-        thermo.clock_minutes = (uint16_t)ui_hour * 60;
-        thermo.update_display = 1;
-    } else if (by_timeout) {
+    if (by_timeout) {
         // nothing
     } else if (p == &P_FACTORY && ui_confirm) {
         settings_defaults(&thermo.cfg);
@@ -415,11 +392,9 @@ static void button_updown_action(int8_t dir, uint16_t accel) {
     if (key_prelude()) return;
 
     if (!menu_is_open(&menu)) {
-        // Main screen: change the active setpoint (not in manual mode and not while tuning)
+        // Main screen: change the setpoint (not in manual mode and not while tuning)
         if (thermo.cfg.manual_mode == 0 && thermo.tune.state != TUNE_RUNNING) {
-            const param_desc_t* sp = &P_SETPOINT;
-            if (thermo.cfg.schedule_enabled) sp = thermostat_is_day() ? &P_DAY_SP : &P_NIGHT_SP;
-            if (param_step(sp, dir, 1)) thermo.params_changed = 1;
+            if (param_step(&P_SETPOINT, dir, 1)) thermo.params_changed = 1;
         }
     } else {
         menu_event_t evt = (dir > 0) ? menu_handle_up(&menu, accel) : menu_handle_down(&menu, accel);
