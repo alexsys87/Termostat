@@ -34,19 +34,6 @@ static int16_t clamp_temp(int32_t t) {
     return (int16_t)t;
 }
 
-bool thermostat_is_day(void) {
-    uint8_t hour = thermo.clock_minutes / 60;
-    uint8_t day_h = thermo.cfg.day_start_hour, night_h = thermo.cfg.night_start_hour;
-    return (day_h <= night_h) ? (hour >= day_h && hour < night_h)
-                              : (hour >= day_h || hour < night_h); // day period crosses midnight
-}
-
-// Setpoint that is active now (day/night one when the schedule is enabled)
-int16_t thermostat_active_setpoint(void) {
-    if (!thermo.cfg.schedule_enabled) return thermo.cfg.setpoint;
-    return thermostat_is_day() ? thermo.cfg.day_setpoint : thermo.cfg.night_setpoint;
-}
-
 bool thermostat_alarm_active(void) {
     return thermo.sensor_error || thermo.alarm_limit || thermo.alarm_latched;
 }
@@ -328,7 +315,7 @@ static void pid_restart(void) {
 // ON/OFF regulator with hysteresis, anti-chatter delay and compressor protection
 static uint8_t onoff_regulator(void) {
     const settings_t* c = &thermo.cfg;
-    int16_t sp = thermostat_active_setpoint();
+    int16_t sp = c->setpoint;
     int16_t t = thermo.temp;
     uint8_t want = thermo.relay_state;
 
@@ -360,7 +347,7 @@ static uint8_t pid_regulator(bool new_measurement, uint32_t dt_ms) {
 
     if (new_measurement) {
         pid_config_t pc = {c->kp, c->ki, c->kd, c->pid_output_limit, c->mode};
-        int32_t out = pid_update(&pid, &pc, thermostat_active_setpoint(), thermo.temp, dt_ms);
+        int32_t out = pid_update(&pid, &pc, c->setpoint, thermo.temp, dt_ms);
         if (out / PID_OUTPUT_SCALE != thermo.pid_output / PID_OUTPUT_SCALE) thermo.update_display = 1;
         thermo.pid_output = out;
     }
@@ -395,7 +382,7 @@ static uint8_t tune_regulator(bool new_measurement) {
 
     if (new_measurement) {
         uint8_t cycles = thermo.tune.measured;
-        autotune_update(&thermo.tune, thermo.temp, thermostat_active_setpoint(), c->mode,
+        autotune_update(&thermo.tune, thermo.temp, c->setpoint, c->mode,
                         c->pid_output_limit, tick_count);
         if (cycles != thermo.tune.measured) thermo.update_display = 1;
 
@@ -489,13 +476,12 @@ static void minute_task(void) {
 
     if (thermo.relay_state) thermo.cfg.total_runtime++;
 
-    if (++thermo.clock_minutes >= 24 * 60) {
-        thermo.clock_minutes = 0;
-        // New day: restart the daily extremes
+    // Daily extremes are restarted every 24 hours of operation (there is no real-time clock)
+    if (++thermo.day_minutes >= 24 * 60) {
+        thermo.day_minutes = 0;
         thermo.day_min = thermo.temp;
         thermo.day_max = thermo.temp;
     }
-    if (thermo.cfg.schedule_enabled) thermo.update_display = 1;
 
     // Statistics are written once a day (only the counters, not unsaved settings)
     if (++stats_minutes >= STATS_SAVE_PERIOD_MIN) {

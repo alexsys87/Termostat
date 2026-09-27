@@ -99,8 +99,6 @@ void settings_defaults(settings_t* s) {
     s->temp_min = 0;                // 0.0 C
     s->temp_max = 400;              // 40.0 C
     s->alarm_hyst = 10;             // 1.0 C
-    s->day_setpoint = 220;
-    s->night_setpoint = 180;
     s->cal_p1_ref = 0;              // identity calibration
     s->cal_p1_meas = 0;
     s->cal_p2_ref = 1000;
@@ -129,9 +127,6 @@ void settings_defaults(settings_t* s) {
     s->sensor_source = SRC_SENSOR1;
     s->relay_delay = 2;
     s->cycle_protection = 3;
-    s->schedule_enabled = 0;
-    s->day_start_hour = 7;
-    s->night_start_hour = 23;
     s->auto_save = 1;
     s->beep_enabled = 1;
     s->power_save = 0;
