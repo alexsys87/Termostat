@@ -1,5 +1,5 @@
 #include "HD44780.h"
-#include "main.h" // Подключаем main.h для использования точных аппаратных delay_us и delay_ms
+#include "main.h" // main.h provides the precise delay_us() and delay_ms()
 
 static void gpio_set(GPIO_TypeDef* port, uint16_t pin) {
     port->BSRR = pin;
@@ -10,13 +10,13 @@ static void gpio_reset(GPIO_TypeDef* port, uint16_t pin) {
 }
 
 static void gpio_set_output(GPIO_TypeDef* port, uint16_t pin) {
-    // Безопасный перебор битов (исключает бесконечный цикл)
+    // Iterate over all 16 bits of the mask
     for(int i = 0; i < 16; i++) {
         if (pin & (1 << i)) {
             port->MODER &= ~(0x3 << (i * 2));
             port->MODER |=  (0x1 << (i * 2));
             port->OTYPER &= ~(1 << i);
-            port->OSPEEDR |= (0x3 << (i * 2)); // High speed для стабильности
+            port->OSPEEDR |= (0x3 << (i * 2)); // High speed for clean edges
             port->PUPDR &= ~(0x3 << (i * 2));
         }
     }
@@ -30,14 +30,19 @@ static void enable_gpio_clock(GPIO_TypeDef* port) {
 
 static void pulse_enable(HD44780* lcd) {
     gpio_set(lcd->control_port, lcd->e_pin);
-    delay_us(1); // Минимально необходимая длительность импульса E
+    delay_us(1); // Minimal E pulse width (450 ns)
     gpio_reset(lcd->control_port, lcd->e_pin);
     delay_us(50);
 }
 
 static void send_nibble(HD44780* lcd, uint8_t data) {
-    for (int i = 0; i < 4; i++) gpio_reset(lcd->data_port, lcd->data_pins[i]);
-    for (int i = 0; i < 4; i++) if (data & (1 << i)) gpio_set(lcd->data_port, lcd->data_pins[i]);
+    // All four data lines are updated with a single atomic BSRR write
+    uint32_t set_mask = 0, reset_mask = 0;
+    for (int i = 0; i < 4; i++) {
+        if (data & (1 << i)) set_mask |= lcd->data_pins[i];
+        else reset_mask |= lcd->data_pins[i];
+    }
+    lcd->data_port->BSRR = set_mask | (reset_mask << 16);
     pulse_enable(lcd);
 }
 
@@ -76,10 +81,10 @@ void HD44780_init(HD44780* lcd,
     gpio_reset(control_port, e_pin);
     for (int i = 0; i < 4; i++) gpio_reset(data_port, data_pins[i]);
 
-    // Ожидание готовности питания дисплея (минимум 40мс по даташиту)
+    // Wait for the display power-up (at least 40 ms per datasheet)
     delay_ms(50);
 
-    // Строгая последовательность инициализации 4-битного режима по даташиту
+    // 4-bit mode initialization sequence per datasheet
     send_nibble(lcd, 0x03);
     delay_ms(5);
     send_nibble(lcd, 0x03);
@@ -87,31 +92,30 @@ void HD44780_init(HD44780* lcd,
     send_nibble(lcd, 0x03);
     send_nibble(lcd, 0x02);
 
-    // Настройка параметров
+    // Display parameters
     send_command(lcd, HD44780_FUNCTION_SET | HD44780_4BIT_MODE | HD44780_2LINE | HD44780_5x8DOTS);
     send_command(lcd, HD44780_DISPLAY_CONTROL | HD44780_DISPLAY_OFF);
     send_command(lcd, HD44780_CLEAR_DISPLAY);
     send_command(lcd, HD44780_ENTRY_MODE_SET | HD44780_ENTRY_LEFT);
 
-    // Включение дисплея
+    // Switch the display on
     lcd->display_control = HD44780_DISPLAY_ON | HD44780_CURSOR_OFF | HD44780_BLINK_OFF;
     send_command(lcd, HD44780_DISPLAY_CONTROL | lcd->display_control);
     delay_ms(2);
 }
 
+// send_command() already waits 2 ms for CLEAR/HOME
 void HD44780_clear(HD44780* lcd) {
     send_command(lcd, HD44780_CLEAR_DISPLAY);
-    delay_ms(2); // Очистка требует длительного времени
 }
 
 void HD44780_home(HD44780* lcd) {
     send_command(lcd, HD44780_RETURN_HOME);
-    delay_ms(2); // Возврат каретки требует длительного времени
 }
 
 void HD44780_cursor_to(HD44780* lcd, uint8_t col, uint8_t row) {
-    uint8_t row_offsets[] = {HD44780_ROW0_ADDR, HD44780_ROW1_ADDR};
-    if (row >= 2) row = 1;
+    static const uint8_t row_offsets[] = {HD44780_ROW0_ADDR, HD44780_ROW1_ADDR};
+    if (row >= LCD_ROWS) row = LCD_ROWS - 1;
     send_command(lcd, HD44780_SET_DDRAM_ADDR | (col + row_offsets[row]));
 }
 
@@ -121,6 +125,15 @@ void HD44780_put_str(HD44780* lcd, const char* str) {
 
 void HD44780_put_char(HD44780* lcd, char c) {
     send_data(lcd, (uint8_t)c);
+}
+
+// Prints a whole line: text is cut to LCD_COLS and padded with spaces.
+// Overwriting instead of HD44780_clear() avoids flicker and the 2 ms clear delay.
+void HD44780_print_line(HD44780* lcd, uint8_t row, const char* str) {
+    HD44780_cursor_to(lcd, 0, row);
+    for (uint8_t i = 0; i < LCD_COLS; i++) {
+        send_data(lcd, (uint8_t)(*str ? *str++ : ' '));
+    }
 }
 
 void HD44780_display_on(HD44780* lcd) {
