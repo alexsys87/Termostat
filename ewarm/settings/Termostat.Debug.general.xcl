@@ -1,14 +1,12 @@
 C:\iar\ewarm-9.70.1\arm\bin\armproc.dll
 
- C:\iar\ewarm-9.70.1\arm\bin\armjlink.dll
+ C:\iar\ewarm-9.70.1\arm\bin\armsim2.dll
 
- D:\Termostat\Debug\Exe\Termostat.out
+ C:\Users\Lenovo\Desktop\Termostat-main\ewarm\Debug\Exe\Termostat.out
 
  --plugin=C:\iar\ewarm-9.70.1\arm\bin\armLibSupportUniversal.dll
 
  --device_macro=C:\iar\ewarm-9.70.1\arm/config/debugger/ST/STM32F0xx.dmac
-
- --flash_loader=C:\iar\ewarm-9.70.1\arm/config/flashloader/ST/FlashSTM32F03xx4.board
 
  
 

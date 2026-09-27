@@ -23,9 +23,9 @@
 
 if ($debugfile -eq "")
 {
-& "C:\iar\ewarm-9.70.1\common\bin\cspybat" -f "D:\Termostat\settings\Termostat.Debug.general.xcl" --backend -f "D:\Termostat\settings\Termostat.Debug.driver.xcl" 
+& "C:\iar\ewarm-9.70.1\common\bin\cspybat" -f "C:\Users\Lenovo\Desktop\Termostat-main\ewarm\settings\Termostat.Debug.general.xcl" --backend -f "C:\Users\Lenovo\Desktop\Termostat-main\ewarm\settings\Termostat.Debug.driver.xcl" 
 }
 else
 {
-& "C:\iar\ewarm-9.70.1\common\bin\cspybat" -f "D:\Termostat\settings\Termostat.Debug.general.xcl" --debug_file=$debugfile --backend -f "D:\Termostat\settings\Termostat.Debug.driver.xcl" 
+& "C:\iar\ewarm-9.70.1\common\bin\cspybat" -f "C:\Users\Lenovo\Desktop\Termostat-main\ewarm\settings\Termostat.Debug.general.xcl" --debug_file=$debugfile --backend -f "C:\Users\Lenovo\Desktop\Termostat-main\ewarm\settings\Termostat.Debug.driver.xcl" 
 }

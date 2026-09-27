@@ -12,17 +12,7 @@ C:\iar\ewarm-9.70.1\arm\config\debugger\ST\STM32F030F4.ddf
 
 --device=STM32F030F4
 
---drv_communication=USB0
-
---drv_interface_speed=auto
-
---jlink_initial_speed=1000
-
---jlink_reset_strategy=0,0
-
---drv_interface=SWD
-
---drv_catch_exceptions=0x000
+--multicore_nr_of_cores=1
 
 
 
