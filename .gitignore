@@ -5,3 +5,6 @@ Release/
 
 # Host unit tests
 tests/build/
+
+# GCC build output
+build/

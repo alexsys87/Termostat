@@ -1,0 +1,36 @@
+name: Firmware build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc gcc-arm-none-eabi libnewlib-arm-none-eabi make
+          arm-none-eabi-gcc --version
+
+      - name: Unit tests
+        run: make test
+
+      - name: Build firmware
+        run: make -j"$(nproc)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Termostat
+          path: |
+            build/Termostat.elf
+            build/Termostat.hex
+            build/Termostat.bin
+            build/Termostat.map
+          if-no-files-found: error

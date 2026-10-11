@@ -29,6 +29,8 @@
 ```
 Termostat/
 ├── README.md
+├── Makefile                    сборка прошивки arm-none-eabi-gcc (Linux / WSL)
+├── gcc/                        startup и линкер-скрипт для GCC
 ├── docs/
 │   └── lcd_8x2_pinout.png      распиновка дисплея
 ├── ewarm/                      проект IAR Embedded Workbench
@@ -95,7 +97,20 @@ Termostat/
 > после прошивки настройки и статистика один раз сбрасываются к заводским. Коэффициенты ПИД задаются в новых
 > единицах (см. ниже) — проще всего запустить автонастройку.
 
-Контрольная сборка `arm-none-eabi-gcc -Os`: ~14.1 КБ из 15 КБ доступных.
+### Прошивка (GCC, Ubuntu Linux / WSL)
+
+```
+sudo apt install gcc-arm-none-eabi libnewlib-arm-none-eabi make
+make            # build/Termostat.elf, .hex, .bin, .map
+make test       # модульные тесты на ПК
+make clean
+```
+
+Для GCC используются свои `gcc/startup_gcc.c` и `gcc/Termostat.ld` (та же карта памяти, что в `Termostat.icf`);
+исходники в `src/` общие с проектом IAR. Сборка `-Os`: ~14.1 КБ из 15 КБ доступных.
+
+GitHub Actions (`.github/workflows/firmware-build.yml`) на каждый push и pull request запускает тесты и собирает
+прошивку; `.elf/.hex/.bin/.map` доступны в артефакте `Termostat`.
 
 ### Тесты (ПК)
 
