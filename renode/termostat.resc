@@ -1,0 +1,21 @@
+# Interactive run (after `make`):  renode renode/termostat.resc
+$elf?=$ORIGIN/../build/Termostat.elf
+
+include $ORIGIN/models/STM32F0_GPIOPort.cs
+include $ORIGIN/models/HD44780.cs
+include $ORIGIN/models/DS18B20Bus.cs
+
+mach create "termostat"
+machine LoadPlatformDescription $ORIGIN/stm32f030f4.repl
+sysbus.cpu PerformanceInMips 48
+emulation SetGlobalQuantum "0.00001"
+
+sysbus.gpioPortB.ds18b20 Connect 0
+sysbus.gpioPortB.ds18b20 SetTemperature 0 22.5
+
+macro reset
+"""
+    sysbus LoadELF $elf
+    sysbus.flash SetRange 0x3C00 0x400 0xFF
+"""
+runMacro $reset
