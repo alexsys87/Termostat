@@ -36,7 +36,9 @@ LDFLAGS := $(ARCH) -nostartfiles --specs=nano.specs --specs=nosys.specs \
            -Wl,--gc-sections -Wl,-Map=$(BUILD_DIR)/$(TARGET).map \
            -Wl,--print-memory-usage
 
-.PHONY: all clean test
+.PHONY: all clean test renode-test
+
+RENODE_TEST ?= renode-test
 
 all: $(BUILD_DIR)/$(TARGET).elf $(BUILD_DIR)/$(TARGET).hex $(BUILD_DIR)/$(TARGET).bin
 	$(SIZE) $(BUILD_DIR)/$(TARGET).elf
@@ -56,6 +58,10 @@ $(BUILD_DIR)/%.bin: $(BUILD_DIR)/%.elf
 
 test:
 	$(MAKE) -C tests
+
+# Firmware tests in the Renode emulator (renode/termostat.robot)
+renode-test: $(BUILD_DIR)/$(TARGET).elf
+	$(RENODE_TEST) renode/termostat.robot -r $(BUILD_DIR)/renode
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -1,0 +1,123 @@
+// STM32F030F4P6 thermostat board for Renode: MCU, LCD, DS18B20 line, relay, buzzer.
+// Needs the models from renode/models (include them before loading this file).
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m0"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    priorityMask: 0xF0
+    systickFrequency: 48000000
+    IRQ -> cpu@0
+
+flash: Memory.MappedMemory @ sysbus 0x08000000
+    size: 0x4000
+
+sram: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x1000
+
+gpioPortA: GPIOPort.STM32F0_GPIOPort @ sysbus <0x48000000, +0x400>
+    modeResetValue: 0x28000000
+    pullUpPullDownResetValue: 0x24000000
+    [0, 1, 6, 4] -> lcd@[0-3]
+    7 -> lcd@4
+    5 -> lcd@5
+
+gpioPortB: GPIOPort.STM32F0_GPIOPort @ sysbus <0x48000400, +0x400>
+    1 -> ds18b20@0
+
+gpioPortF: GPIOPort.STM32F0_GPIOPort @ sysbus <0x48001400, +0x400>
+    0 -> relay@0
+    1 -> beeper@0
+
+lcd: Miscellaneous.HD44780 @ gpioPortA 5
+
+ds18b20: Sensors.DS18B20Bus @ gpioPortB 1
+    -> gpioPortB@1
+
+relay: Miscellaneous.LED @ gpioPortF 0
+
+beeper: Miscellaneous.LED @ gpioPortF 1
+
+timer14: Timers.STM32_Timer @ sysbus 0x40002000
+    frequency: 48000000
+    initialLimit: 0xFFFF
+    -> nvic@19
+
+iwdg: Timers.STM32_IndependentWatchdog @ sysbus 0x40003000
+    frequency: 40000
+    windowOption: false
+
+// RCC: registers keep their values, the ready flags follow the enable bits, SWS follows SW.
+rcc: Python.PythonPeripheral @ sysbus 0x40021000
+    size: 0x400
+    initable: true
+    script: '''
+if request.isInit:
+    regs = {0x00: 0x00000083, 0x04: 0, 0x24: 0x0C000000}
+elif request.isWrite:
+    regs[request.offset] = request.value
+elif request.isRead:
+    v = regs.get(request.offset, 0)
+    if request.offset == 0x00:
+        v = (v & ~0x02020002) | ((v & 0x1) << 1) | ((v & 0x10000) << 1) | ((v & 0x1000000) << 1)
+    elif request.offset == 0x04:
+        v = (v & ~0xC) | ((v & 0x3) << 2)
+    elif request.offset == 0x24:
+        v = (v & ~0x2) | ((v & 0x1) << 1)
+    request.value = v
+'''
+
+// Flash interface: unlock sequence, page erase (fills 1 KB with 0xFF); programming writes go to memory directly.
+flashCtrl: Python.PythonPeripheral @ sysbus 0x40022000
+    size: 0x400
+    initable: true
+    script: '''
+if request.isInit:
+    acr = 0
+    cr = 0x80
+    ar = 0
+    sr = 0
+    key = 0
+elif request.isWrite:
+    if request.offset == 0x00:
+        acr = request.value
+    elif request.offset == 0x04:
+        if key == 0 and request.value == 0x45670123:
+            key = 1
+        elif key == 1 and request.value == 0xCDEF89AB:
+            cr = cr & ~0x80
+            key = 0
+        else:
+            key = 0
+    elif request.offset == 0x0C:
+        sr = sr & ~(request.value & 0x34)
+    elif request.offset == 0x10:
+        if cr & 0x80:
+            cr = (cr & 0x80) | (request.value & 0x80)
+        else:
+            cr = request.value
+            if (cr & 0x42) == 0x42:
+                page = ar & ~0x3FF
+                for a in range(page, page + 0x400, 4):
+                    sysbus.WriteDoubleWord(a, 0xFFFFFFFF)
+                cr = cr & ~0x40
+                sr = sr | 0x20
+    elif request.offset == 0x14:
+        ar = request.value
+elif request.isRead:
+    if request.offset == 0x00:
+        request.value = acr
+    elif request.offset == 0x0C:
+        request.value = sr
+    elif request.offset == 0x10:
+        request.value = cr
+    elif request.offset == 0x14:
+        request.value = ar
+    else:
+        request.value = 0
+'''
+
+sysbus:
+    init:
+        Tag <0x40015800, 0x40015BFF> "DBGMCU"

@@ -31,6 +31,7 @@ Termostat/
 ├── README.md
 ├── Makefile                    сборка прошивки arm-none-eabi-gcc (Linux / WSL)
 ├── gcc/                        startup и линкер-скрипт для GCC
+├── renode/                     плата, модели периферии и тесты для эмулятора Renode
 ├── docs/
 │   └── lcd_8x2_pinout.png      распиновка дисплея
 ├── ewarm/                      проект IAR Embedded Workbench
@@ -103,6 +104,7 @@ Termostat/
 sudo apt install gcc-arm-none-eabi libnewlib-arm-none-eabi make
 make            # build/Termostat.elf, .hex, .bin, .map
 make test       # модульные тесты на ПК
+make renode-test  # тесты прошивки в Renode (см. ниже)
 make clean
 ```
 
@@ -110,7 +112,28 @@ make clean
 исходники в `src/` общие с проектом IAR. Сборка `-Os`: ~14.1 КБ из 15 КБ доступных.
 
 GitHub Actions (`.github/workflows/firmware-build.yml`) на каждый push и pull request запускает тесты и собирает
-прошивку; `.elf/.hex/.bin/.map` доступны в артефакте `Termostat`.
+прошивку; `.elf/.hex/.bin/.map` доступны в артефакте `Termostat`. Отдельная задача `renode` прогоняет тесты в Renode.
+
+### Тесты в эмуляторе Renode
+
+Собранная `build/Termostat.elf` запускается в [Renode](https://renode.io) на модели платы: STM32F030, ЖКИ HD44780 8×2,
+DS18B20 на 1-Wire, реле, пищалка и кнопки. Модели и описание платы лежат в `renode/`:
+
+- `renode/stm32f030f4.repl` — плата (Flash/RAM, GPIO, TIM14, IWDG, RCC, контроллер Flash);
+- `renode/models/` — GPIO с open-drain (для 1-Wire), ЖКИ HD44780 (4 бита) и до 4 датчиков DS18B20;
+- `renode/termostat.robot` — тесты: показания и уставка на экране, включение/выключение нагрева по гистерезису,
+  защита компрессора, ошибка и восстановление датчика, кнопки и меню, сохранение уставки во Flash.
+
+```
+# Renode 1.15.3 (portable): https://github.com/renode/renode/releases/tag/v1.15.3
+python3 -m pip install -r <renode>/tests/requirements.txt
+make renode-test RENODE_TEST=<renode>/renode-test   # отчёт в build/renode/
+<renode>/renode renode/termostat.resc               # интерактивный запуск
+```
+
+В интерактивном режиме экран читается командой `sysbus.gpioPortA.lcd Screen`, кнопки нажимаются через
+`sysbus.gpioPortA OnGPIO 2 false` (PA2/PA3/PA9, активный уровень — низкий), температура задаётся
+`sysbus.gpioPortB.ds18b20 SetTemperature 0 30.5`.
 
 ### Тесты (ПК)
 
