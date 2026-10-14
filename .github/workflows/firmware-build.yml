@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -25,7 +25,7 @@ jobs:
       - name: Build firmware
         run: make -j"$(nproc)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Termostat
           path: |
@@ -41,7 +41,7 @@ jobs:
       RENODE_VERSION: 1.15.3
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -59,7 +59,7 @@ jobs:
       - name: Renode tests
         run: make -j"$(nproc)" renode-test
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: renode-results
